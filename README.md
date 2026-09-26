@@ -117,6 +117,184 @@ In terminal 2, run the `culprit debug …` command shown at the top of this READ
 - Leave out `--url` to debug from code alone.
 - Run `python scripts/prepare_demo.py` again to reset the demo.
 
+## Inputs and outputs
+
+This section shows every entry point with what goes in and what comes out. The outputs are real, from our runs.
+
+### 1. The demo app with the bug (`sample_app/backend`)
+
+**Input:**
+```bash
+curl -X POST http://localhost:8000/cart/total \
+  -H "Authorization: Bearer culprit-demo-token" -H "Content-Type: application/json" \
+  -d '{"items":[{"price":20,"qty":2}],"discount_code":"SAVE10"}'
+```
+
+**Output:**
+
+| When | Response | Status |
+|---|---|---|
+| Before the fix | `{"total": 32.4}` | ❌ Wrong. The rule is (40 × 1.08) − 10 = 33.20 |
+| After the fix and a server restart | `{"total": 33.2}` | ✅ Correct |
+| With a missing or wrong token | `401 {"error": "Unauthorized"}` | |
+
+### 2. `culprit debug` (CLI)
+
+**Input:**
+
+| Flag | Meaning | Example |
+|---|---|---|
+| `--issue` (required) | The bug, in one sentence | `"cart total wrong when discount code applied"` |
+| `--folder` (1–6, repeatable) | A code folder, one per codebase | `demo_workspace/sample_app/shared` |
+| `--url` | Live endpoint to probe (optional) | `http://localhost:8000/cart/total` |
+| `--method`, `--body` | How to call the URL | `POST`, `'{"items":[...],"discount_code":"SAVE10"}'` |
+| `--auth-bearer` / `--no-auth` | Auth for the probe (the token comes from `BEARER_TOKEN` in `.env`) | |
+| `--dry-run` | Analyse only: report the fix, change nothing | |
+| `--json-report PATH` | Also write the final report as JSON | `report.json` |
+
+**Output (terminal, abbreviated):** in the real output, the fix diff appears in a framed, syntax-highlighted box.
+```
+   0.0s  🔁 Attempt 1/3
+   0.0s    🌐 Probing live POST http://localhost:8000/cart/total…
+   0.3s       ↳ HTTP 200: {"total":32.4}
+   0.3s    🔍 Running Reproducer + CauseTracer in parallel…
+  37.7s    🧪 Writing and running repro test…
+  38.6s    ✏️  Running FixAuthor…
+  47.5s    🛡  Running Guard…
+  61.6s    🔧 Applying fix…
+  61.6s    🧪 Running full test suite…
+  62.9s    ✅ Tests passed — committing…
+──────────────── Culprit Report ────────────────
+  Status:       FIXED
+  Elapsed:      63.3s
+  Bobcoins:     0.2089
+  Root cause:   pricing.py:28  [shared]  confidence=99%
+  Fix diff:     -    discounted_subtotal = subtotal - discount
+                -    total = discounted_subtotal * (1 + tax_rate)
+                +    total = subtotal * (1 + tax_rate) - discount
+  Tests:        PASSED
+  Commit SHA:   2ba122aacc5ff13964c665d03fbf7c83563d2695
+```
+
+**Other outputs:**
+- **Exit code:** `0` when FIXED, `1` otherwise (NEEDS_HUMAN or PARTIAL).
+- **Side effects when FIXED:**
+  - A git commit in the target repo, containing the fixed source file and `tests/test_culprit_regression.py`.
+  - The temporary repro test is deleted.
+
+**Possible statuses:**
+
+| Status | Meaning |
+|---|---|
+| `FIXED` | The fix is applied, every test passes, and it's committed |
+| `NEEDS_HUMAN` | The bug couldn't be reproduced (the repro test passes, E9), confidence was below 0.70 (E5), or all 3 attempts failed |
+| `PARTIAL` | `--dry-run` was used, or the Bobcoin budget ran out (E4) |
+
+### 3. JSON report (`--json-report`)
+
+```json
+{
+  "status": "FIXED",
+  "bug": { "description": "cart total wrong when discount code applied", "runtime_evidence": [], "static_evidence": ["..."] },
+  "root_cause": {
+    "codebase": "shared", "file": "pricing.py", "line": 28, "symbol": "compute_cart_total",
+    "explanation": "The discount is subtracted before tax is applied ...", "confidence": 0.99
+  },
+  "fix": {
+    "target_codebase": "shared",
+    "edits": [ { "file": "pricing.py", "old_text": "...", "new_text": "..." } ],
+    "unified_diff": "--- a/pricing.py\n+++ b/pricing.py\n@@ ...",
+    "applied_files": ["pricing.py"]
+  },
+  "regression_test": { "codebase": "shared", "file": "tests/test_culprit_regression.py", "test_name": "...", "code": "..." },
+  "attempts": [ { "num": 1, "subagent_outputs": {}, "test_result": { "passed": true, "output": "...", "failed_tests": [] }, "failure_reason": null } ],
+  "elapsed_seconds": 63.3,
+  "bobcoins_used": 0.2089,
+  "commit_sha": "2ba122aacc5ff13964c665d03fbf7c83563d2695"
+}
+```
+Tokens never appear in the report, because `AuthContext.token` is excluded from serialisation.
+
+### 4. `culprit serve` HTTP API (used by the Orchestrate tools)
+
+Every `/debug` call needs `Authorization: Bearer <CULPRIT_API_TOKEN>`.
+
+| Endpoint | Input | Output |
+|---|---|---|
+| `GET /health` | none | `{"status": "ok"}` |
+| `POST /debug` | `{"issue": "Customers say the cart total is wrong when they use the SAVE10 discount code"}` (5–500 chars; no other field is accepted) | `202 {"job_id": "77852e466795", "status": "running", "message": "Culprit started. A run takes about 60 seconds; ..."}` |
+| `GET /debug/{job_id}` | the `job_id` | While running: `{"status": "running", "progress": [...], "summary": "Culprit is still working..."}`. When done: see below |
+
+When done, `GET /debug/{job_id}` returns this (real response through the public tunnel):
+```json
+{
+  "job_id": "77852e466795",
+  "status": "done",
+  "elapsed_seconds": 74.1,
+  "progress": ["0.3s  ↳ HTTP 200: {\"total\":32.4}", "...", "72.4s  ✅ Tests passed — committing…"],
+  "culprit_status": "FIXED",
+  "root_cause": "shared/pricing.py:28 (compute_cart_total): The docstring ... states the correct business rule ...",
+  "fix_diff": "--- a/pricing.py\n+++ b/pricing.py\n...",
+  "tests_passed": true,
+  "commit_sha": "3e6c3f1d53ae961ae465af2e9a8ebaa8507339a3",
+  "bobcoins_used": 0.181,
+  "summary": "FIXED in 73s for 0.181 Bobcoins. Root cause: shared/pricing.py line 28. All tests pass; fix and regression test committed (3e6c3f1)."
+}
+```
+
+| Error | When |
+|---|---|
+| `401` | Missing or wrong token |
+| `503` | `CULPRIT_API_TOKEN` is not set on the server |
+| `409` | A run is already in progress |
+| `404` | Unknown `job_id` |
+| `422` | `issue` is too short or too long |
+
+### 5. watsonx Orchestrate agent and tools
+
+| Tool (in `orchestrate/culprit_openapi.yaml`) | Input | Output |
+|---|---|---|
+| `start_culprit_debug` | `issue` (string) | `job_id`, `status`, `message`, the same as `POST /debug` |
+| `get_culprit_debug_result` | `job_id` (string) | The result object from section 4 |
+
+The agent `culprit_oncall` (in `orchestrate/culprit_agent.yaml`) works like this:
+- **Input:** a chat message describing the bug.
+- **What it does:** calls `start_culprit_debug` and replies with the job id. When asked for the status, it calls `get_culprit_debug_result`.
+- **Output:** it reports the Culprit status, the root cause file and line, whether the tests passed, the commit SHA, the time taken and the Bobcoins used.
+
+### 6. IBM Bob subagents (inside Culprit, through Bob Shell)
+
+**How Culprit calls Bob:** `bob run --format json --mode ask --max-cost <remaining> --max-turns 8 -w <project root> "<prompt>"`
+
+**What Bob Shell returns:** one JSON line.
+```json
+{"type":"result","status":"success","stats":{"session_costs":0.0368},"last_message":"<answer, often inside a json code fence>"}
+```
+
+| Subagent | Input (in its prompt) | Output (JSON that Culprit validates) |
+|---|---|---|
+| **Reproducer** | Issue text, redacted live evidence, the codebase list, and the prior failure (if any) | `{"file": "tests/test_culprit_repro.py", "code": "<pytest that FAILS on current code>"}` |
+| **CauseTracer** | Issue text, redacted live evidence, the codebase list, and the prior failure (if any) | `{"codebase": "shared", "file": "pricing.py", "line": 28, "symbol": "compute_cart_total", "explanation": "...", "confidence": 0.99}` |
+| **FixAuthor** | The root cause, the codebase list, and the prior failure (if any) | `[{"target_codebase": "shared", "edits": [{"file": "pricing.py", "old_text": "<exact, unique>", "new_text": "..."}]}]` (up to 3, lowest risk first) |
+| **Guard** | The root cause and the chosen fix | `{"codebase": "shared", "file": "tests/test_culprit_regression.py", "test_name": "...", "code": "<permanent pytest>"}` |
+
+### 7. Scripts
+
+| Script | Input | Output |
+|---|---|---|
+| `scripts/prepare_demo.py` | none | A fresh, buggy copy at `demo_workspace/sample_app/`, set up as its own git repo with one baseline commit |
+| `scripts/run_backend.py` | `BEARER_TOKEN` from `.env` | The demo backend running on `http://localhost:8000` |
+| `scripts/orchestrate_deploy.py` | `--tunnel-url`, optional `--llm` / `--list-models`, and `WO_INSTANCE_URL` + `WO_API_KEY` from `.env` | A bearer connection `culprit_api`, the two tools, and the agent `culprit_oncall`, all deployed in your Orchestrate instance (secrets are printed as `***`) |
+
+### 8. Environment variables (`.env`)
+
+| Variable | Needed for | Where it comes from |
+|---|---|---|
+| `BOB_API_KEY` | Culprit calling Bob Shell (**required**) | bob.ibm.com, then **API keys**, with Inference scope |
+| `BEARER_TOKEN` | The demo backend and `--auth-bearer` | Any value; the demo uses `culprit-demo-token` |
+| `CULPRIT_API_TOKEN` | `culprit serve` | Generated by `orchestrate_deploy.py`, or any random string |
+| `WO_INSTANCE_URL`, `WO_API_KEY` | Deploying the Orchestrate agent (optional) | Orchestrate, under **Settings** and then **API details** |
+
 ## Trigger it from chat with watsonx Orchestrate
 
 An on-call engineer shouldn't need a terminal. Culprit ships a **watsonx Orchestrate** agent, `culprit_oncall`, with two tools that run Culprit from chat:
