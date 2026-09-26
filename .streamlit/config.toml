@@ -1,0 +1,17 @@
+# Streamlit theme for Compass — calm, professional, works in light and dark.
+[theme]
+base = "light"
+primaryColor = "#4f46e5"          # indigo — the Compass accent
+backgroundColor = "#ffffff"
+secondaryBackgroundColor = "#f8fafc"
+textColor = "#0f172a"
+font = "sans serif"
+
+[server]
+headless = true
+# runOnSave is OFF so in-flight Bob subprocesses aren't killed by file edits.
+runOnSave = false
+enableXsrfProtection = true
+
+[browser]
+gatherUsageStats = false

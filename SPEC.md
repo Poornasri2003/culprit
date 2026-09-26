@@ -1,307 +1,208 @@
-# Culprit — Product Specification v1.0
+# Compass — Schemas & subagent prompts
 
-## 1. Purpose
-Culprit is a Python CLI tool built on IBM Bob 2.0 that debugs live
-backend services and multi-codebase projects. Given running endpoints
-+ source code, it authenticates, reproduces the failure at runtime,
-traces the root cause across codebases, generates a verified fix, and
-writes a regression test.
+Companion to [ARCHITECTURE.md](ARCHITECTURE.md). This file locks down the JSON schemas each Bob subagent must produce and the system prompts that drive them. If the code and this doc disagree, this doc is wrong — fix it here first.
 
-Culprit combines RUNTIME evidence (real HTTP calls, real responses,
-real errors) with STATIC evidence (source code across N codebases) —
-this is the differentiator vs static-only AI debuggers.
+---
 
-## 2. Command-line interface
+## 1. Shared types
 
-    culprit debug [inputs...] --issue "<description>"
+```python
+# src/compass/domain/models.py
+from pydantic import BaseModel, Field
+from typing import Literal
 
-    Input flags (at least one code source + optionally a live URL):
-      --url URL              Live endpoint to probe (repeatable)
-      --method METHOD        HTTP method for the probe (default GET)
-      --body TEXT            Request body for the probe (e.g. JSON)
-      --folder PATH          Local code folder (repeatable, 1-6)
-      --git URL              Remote repo to clone (repeatable, 1-4)
+class FileRef(BaseModel):
+    path: str                    # repo-relative POSIX path
+    line_start: int | None = None
+    line_end: int | None = None
+```
 
-    Auth flags (choose one when --url is used):
-      --auth-bearer          Reads BEARER_TOKEN from .env
-      --auth-basic           Reads BASIC_USER, BASIC_PASS from .env
-      --auth-oauth2          Reads OAUTH_CLIENT_ID, OAUTH_CLIENT_SECRET,
-                             OAUTH_TOKEN_URL from .env
-      --auth-apikey          Reads API_KEY, API_KEY_HEADER from .env
-      --no-auth              Explicit for public endpoints
+## 2. Scout
 
-    Behavior flags:
-      --issue TEXT           Bug description (required)
-      --trace PATH           Optional: path to a stack trace / error log
-      --dry-run              Analyze only; no fix applied, no commit
+**Job:** inventory the repo. Read-only. No architectural claims.
 
-## 3. Hard limits (deterministic — NOT decided by AI)
-Defined in src/culprit/config.py:
+**Output schema — `RepoInventory`**
 
-    MAX_ATTEMPTS = 3
-    MAX_WALLCLOCK_SECONDS = 240
-    MAX_FILES_PER_SUBAGENT = 25
-    MAX_CODEBASES = 6
-    MAX_URLS = 3
-    MAX_BOBCOIN_PER_RUN = 8
-    CONFIDENCE_FLOOR = 0.70
-    HTTP_TIMEOUT_SECONDS = 15
-    AUTH_TOKEN_TTL_SECONDS = 300
+```python
+class Language(BaseModel):
+    name: str                    # "python", "typescript", ...
+    file_count: int
+    percent: float               # of tracked source files
 
-## 4. Domain model (Pydantic — schema-enforced)
+class EntryPoint(BaseModel):
+    kind: Literal["cli", "http_server", "worker", "library", "script", "container"]
+    file: FileRef
+    hint: str                    # one sentence
 
-    class Endpoint:
-        url: str
-        method: str
-        headers: dict
-        expected_status: int
-        actual_status: Optional[int]
+class RepoInventory(BaseModel):
+    name: str
+    description: str             # ≤ 300 chars, pulled from README/package metadata
+    languages: list[Language]
+    package_managers: list[str]  # "pip", "poetry", "npm", "pnpm", "cargo", ...
+    entry_points: list[EntryPoint]
+    top_dirs: list[str]          # top-level source directories, in traversal order
+    tracked_file_count: int
+    size_estimate_tokens: int    # for the budget gate in the orchestrator
+```
 
-    class AuthContext:
-        scheme: BEARER | BASIC | OAUTH2 | APIKEY | NONE
-        token: Optional[str]  # never logged, never in report
-        expires_at: Optional[datetime]
+**System prompt (excerpt).**
 
-    class RuntimeEvidence:
-        endpoint: Endpoint
-        request_body: Optional[str]
-        response_body: str
-        response_status: int
-        latency_ms: float
-        stack_trace_hint: Optional[str]
+> You are Compass's Scout. Your job is inventory, not judgment. Never guess a language from a filename alone — read the file if you're unsure. Never invent files. Never speculate about architecture; that is the Cartographer's job. Emit exactly one JSON object matching `RepoInventory`. If a field is unknown, use `null` — do not fabricate.
 
-    class SourceCodebase:
-        name: str
-        root_path: Path
-        language: str
-        entry_points: list[str]
+**Tool allowlist:** `list_dir`, `read_file`, `search`.
 
-    class Bug:
-        description: str
-        runtime_evidence: list[RuntimeEvidence]
-        static_evidence: list[SourceCodebase]
+## 3. Cartographer
 
-    class RootCause:
-        codebase: str
-        file: str
-        line: int
-        symbol: str
-        explanation: str
-        confidence: float  # 0.0 - 1.0
+**Job:** produce a **verified** architecture map. Every edge must be backed by evidence.
 
-    class Fix:
-        target_codebase: str
-        unified_diff: str
-        applied_files: list[str]
+**Output schema — `ArchitectureMap`**
 
-    class RegressionTest:
-        codebase: str
-        file: str
-        test_name: str
-        code: str
+```python
+class Module(BaseModel):
+    name: str                        # human-readable, e.g. "checkout.api"
+    root: str                        # repo-relative directory
+    role: str                        # one sentence
+    exemplar_files: list[FileRef]    # 1–3 files representative of this module
 
-    class Attempt:
-        num: int
-        subagent_outputs: dict
-        test_result: Optional[TestResult]
-        failure_reason: Optional[str]
+class Edge(BaseModel):
+    from_module: str                 # Module.name
+    to_module: str                   # Module.name
+    kind: Literal["imports", "calls", "http", "queue", "db"]
+    evidence: list[FileRef]          # concrete files/lines proving the edge
 
-    class CulpritReport:
-        status: FIXED | PARTIAL | NEEDS_HUMAN
-        bug: Bug
-        root_cause: Optional[RootCause]   # None if run aborted before tracing
-        fix: Optional[Fix]
-        regression_test: Optional[RegressionTest]
-        attempts: list[Attempt]
-        elapsed_seconds: float
-        bobcoins_used: float
-        commit_sha: Optional[str]           # set when status = FIXED
+class SpinePath(BaseModel):
+    name: str                        # e.g. "checkout → auth → db"
+    steps: list[FileRef]             # ordered
 
-## 5. Subagents (Strategy pattern; each has a specific output type)
+class ArchitectureMap(BaseModel):
+    modules: list[Module]
+    edges: list[Edge]
+    spine_paths: list[SpinePath]     # 3–5 end-to-end request/data flows
+    mermaid: str                     # rendered Mermaid diagram source
+```
 
-    Reproducer(workspace, bug) -> FailingTest
-      * If --url provided: the orchestrator has already probed it; the
-        captured RuntimeEvidence is given to Reproducer as context
-      * ALWAYS writes a pytest that exercises the code path IN-PROCESS
-        (e.g. Flask test_client), never the live URL — a running server
-        keeps old code loaded, so a live-URL test cannot see a fix
-      * The bug is "observable" only if this test FAILS on current code
+**System prompt (excerpt).**
 
-    CauseTracer(workspace, bug, runtime_evidence) -> RootCause
-      * Walks source code across ALL codebases
-      * Follows imports/API contracts between codebases
-      * Correlates runtime response with source lines
-      * Assigns confidence 0.0-1.0
+> You are Compass's Cartographer. Do not include an edge unless you can cite the file and line that proves it, using `search` or `find_references`. Prefer fewer, correct edges over many speculative ones. Every entry in `edges[].evidence` must come from a tool call in this session — you are not permitted to cite from memory. The Mermaid diagram must include only modules and edges you have already listed.
 
-    FixAuthor(workspace, root_cause) -> list[Fix]
-      * Proposes up to 3 candidate patches
-      * Ranked by risk (quick patch < proper fix < refactor)
+**Tool allowlist:** `list_dir`, `read_file`, `search`, `find_references`.
 
-    Guard(workspace, root_cause, fix) -> RegressionTest
-      * Writes a pytest that would have caught this bug
-      * Never touches the fix code itself
+## 4. DevLoopRunner
 
-## 6. Self-healing orchestrator loop
+**Job:** produce the actual commands that work. Bob proposes; the runner executes; only what passes gets written.
 
-    workspace = load(folders, git_urls)
-    auth = build_auth_context(auth_flag)  # from env vars only
+**Output schema — `DevLoop`**
 
-    for attempt in range(MAX_ATTEMPTS):
-        runtime_evidence = probe_url(url, auth) if url else None
-        parallel_run(Reproducer, CauseTracer)   # both use runtime_evidence
-        if failing_test passes on current code:
-            return NEEDS_HUMAN (BugNotObservable, E9)
-        if confidence < CONFIDENCE_FLOOR:
-            return NEEDS_HUMAN
-        candidates = FixAuthor(root_cause)       # up to 3, lowest risk first
-        fix = candidates[0]                      # lowest risk; §12
-        regression_test = Guard(root_cause, fix)
-        apply(fix + regression_test)
-        result = test_runner.run(all_codebases)
-        if result.passed:
-            git.commit(fix + regression_test)
-            return FIXED
-        revert(fix)
-        record failure  # feeds next attempt as context
+```python
+class Command(BaseModel):
+    label: str                       # "install", "test", "lint", ...
+    cmd: str
+    cwd: str | None = None
+    exit_code: int
+    duration_seconds: float
+    tail_stdout: str                 # last 40 lines, capped
+    tail_stderr: str
+    verdict: Literal["ok", "flaky", "failed", "skipped"]
 
-    return NEEDS_HUMAN
+class DevLoop(BaseModel):
+    prerequisites: list[str]         # e.g. "python 3.11+", "docker"
+    commands: list[Command]          # in the order a newcomer should run them
+    notes: list[str]                 # human-readable caveats
+```
 
-## 7. Edge cases (explicit — every one has a defined behavior)
+**Loop protocol.**
 
-    E1  No tests in any codebase -> skip Guard, status = PARTIAL
-    E2  Bob returns malformed JSON -> pydantic error -> one retry
-        inside bob_client -> then SubagentError
-    E3  Fix breaks other tests -> revert, next attempt gets failure log
-    E4  Bobcoin budget exhausted -> BudgetExhausted -> status = PARTIAL
-    E5  Confidence < 0.70 -> DO NOT apply fix -> NEEDS_HUMAN
-    E6  --dry-run -> subagents run, no apply, no commit
-    E7  Auth token acquisition fails -> AuthError -> abort, no partial
-    E8  URL unreachable (timeout/DNS) -> UnreachableError -> abort
-    E9  Reproducer's failing test PASSES on current code (bug not
-        reproducible) -> BugNotObservable -> NEEDS_HUMAN with a message
-        asking for a better --issue text. NOTE: an HTTP 200 alone is NOT
-        E9 — a wrong value returned with 200 is a real bug.
-    E10 Bug spans codebases we don't have -> NEEDS_HUMAN with message
-        naming the missing codebase
+1. Bob proposes one command at a time as a tool call to `run_command`.
+2. The runner executes it (sandboxed, 60 s timeout, 4 KB output cap) and returns exit code + tails.
+3. Bob decides whether to record it, retry with a variant, or give up on that step.
+4. Bob emits a final `DevLoop` where each `Command` has `verdict != "skipped"` **only if** the runner actually executed it in this session.
 
-## 8. Where AI adds value (defensible in interview)
+**System prompt (excerpt).**
 
-    - Semantic mapping between runtime response and source lines
-      across N codebases (no static analyzer can do this)
-    - Natural language --issue -> concrete failing pytest
-    - Root cause reasoning that ties HTTP response payload
-      to specific lines in specific files across services
+> You are Compass's DevLoopRunner. You may only claim a command works if you ran it in this session and it returned exit code 0. If a command fails, either propose a fix and retry once, or record it with `verdict: "failed"` and move on — do not lie. Never invent commands that were not executed.
 
-## 9. Where deterministic code decides (NOT AI)
+**Tool allowlist:** `list_dir`, `read_file`, `run_command`.
 
-    - Loop control (retry count, budget)
-    - HTTP client (requests, timeouts, retries)
-    - Auth flow (token acquisition, refresh, TTL)
-    - Test execution and result parsing
-    - Git operations (commit, diff, revert)
-    - Pydantic schema validation
-    - Which fix is kept: the full test suite decides (§12)
+## 5. Guide
 
-## 10. Secrets policy (hard rule)
+**Job:** the reading tour and three starter tasks.
 
-    - All credentials live in .env, referenced by env var name
-    - .env is git-ignored AND bob-ignored (verified in Step 3)
-    - Tokens NEVER appear in report objects, log lines, or Bob
-      chat context
-    - bob_client.py redacts headers containing 'Authorization',
-      'X-API-Key', 'Cookie' before sending prompts to Bob
+**Output schema — `Guide`**
 
-## 11. Demo scenario (for video)
+```python
+class TourStop(BaseModel):
+    order: int
+    file: FileRef
+    why: str                         # 1–2 sentences: why this file matters
+    notice: str                      # 1–2 sentences: what to pay attention to
 
-    Multi-service e-commerce sample:
-      sample_app/frontend  (Flask, calls backend)
-      sample_app/backend   (Flask, /cart/total endpoint)
-      sample_app/shared    (pricing library)
+class HintLadder(BaseModel):
+    small: str                       # a nudge
+    medium: str                      # a pointer
+    large: str                       # nearly the answer
 
-    Seeded bug: pricing library applies discount pre-tax,
-    frontend expects post-tax discount.
+class StarterTask(BaseModel):
+    title: str
+    difficulty: Literal["easy", "medium"]
+    files_to_touch: list[FileRef]
+    acceptance_criteria: list[str]   # bullet points, testable
+    hints: HintLadder
 
-    Demo run:
-      culprit debug \
-        --url http://localhost:8000/cart/total \
-        --auth-bearer \
-        --folder ./sample_app/frontend \
-        --folder ./sample_app/backend \
-        --folder ./sample_app/shared \
-        --issue "cart total wrong when discount code applied"
+class Guide(BaseModel):
+    tour: list[TourStop]             # 6–10 stops, ordered
+    starter_tasks: list[StarterTask] # exactly 3
+```
 
-## 12. Fix selection: the test suite is the judge
+**System prompt (excerpt).**
 
-    FixAuthor returns up to 3 candidates ranked lowest risk first
-    (quick patch < proper fix < refactor). Culprit applies candidate 0.
-    Whether it stays is decided deterministically, never by a model:
+> You are Compass's Guide. Pick tour stops by dependency depth, not by file size. A good tour teaches the shape of the system in 30 minutes. Draft starter tasks that a new teammate can finish in half a day — no research spikes, no infra changes, no "rewrite this module." Each task must have three hint levels: `small` (a nudge), `medium` (a pointer), `large` (nearly the answer).
 
-      * the Reproducer's test must FAIL before the fix (E9), and
-      * the WHOLE test suite, including the new regression test, must PASS
-        after it. Otherwise the fix is reverted and the failing tests feed
-        the next attempt (max MAX_ATTEMPTS).
+**Tool allowlist:** `list_dir`, `read_file`, `search`, `git_log`.
 
-    Design note: an optional watsonx.ai "adjudicator" (a second model
-    scoring each fix) was designed and then removed, because no IBM Cloud
-    account was available during the hackathon. Tests are an objective
-    judge that needs no second model.
+## 6. Orchestrator report
 
-## 13. Where each part adds value (defensible answer)
+The orchestrator wraps everything into a top-level record used by the CLI, the server, and `bob_sessions/report.json`.
 
-    IBM Bob subagents: repository-aware, multi-file semantic reasoning:
-      mapping a live HTTP response to source lines across codebases,
-      writing tests, and proposing exact edits.
+```python
+class SubagentReport(BaseModel):
+    name: Literal["scout", "cartographer", "devloop_runner", "guide"]
+    started_at: str                  # ISO 8601
+    duration_seconds: float
+    tokens_prompt: int
+    tokens_completion: int
+    retries: int
+    ok: bool
+    error: str | None = None
 
-    watsonx Orchestrate agent (§16): the chat front door; lets anyone on
-      the team trigger a Culprit run and read the result without a
-      terminal.
+class OnboardingPack(BaseModel):
+    repo: str
+    role: str | None = None
+    inventory: RepoInventory
+    architecture: ArchitectureMap
+    devloop: DevLoop
+    guide: Guide
+    subagents: list[SubagentReport]
+    total_wall_clock_seconds: float
+    total_tokens: int
+```
 
-    Deterministic code: budget, HTTP, auth, applying edits, running tests,
-      git, schema validation, loop control, and the keep-or-revert decision.
+## 7. `/ask` protocol
 
-## 14. Bob runtime integration (how Culprit calls Bob)
+```python
+class AskRequest(BaseModel):
+    question: str
+    top_k: int = 6                   # chunks to retrieve
 
-    Culprit's subagents call IBM Bob through Bob Shell in non-interactive
-    mode, as a subprocess (bob_client.py):
+class AskCitation(BaseModel):
+    file: str
+    line_start: int
+    line_end: int
+    snippet: str
 
-        bob run --format json --mode <ask|agent> --workspace <path>
-                --max-cost <remaining budget> --accept-license "<prompt>"
+class AskAnswer(BaseModel):
+    answer: str                      # or "I don't know from this repo"
+    citations: list[AskCitation]     # empty allowed only on the refusal answer
+    grounded: bool                   # false ⇒ refused
+```
 
-    * Auth: Bob Shell's own login (SSO) or BOB_API_KEY in the environment.
-      Culprit never reads, logs or passes BOB_API_KEY itself.
-    * Budget: --max-cost is set per call to
-      MAX_BOBCOIN_PER_RUN - bobcoins_used so far (hard cap enforced by Bob
-      AND by Culprit). Cost per call is read from the JSON output if present.
-    * The target service's AuthContext is NEVER passed to bob_client.
-    * Prerequisite: Node.js >= 24 and Bob Shell installed.
-
-    Bob IDE is used to BUILD Culprit (task sessions exported to
-    bob_sessions/ for judging); Bob Shell is used by Culprit at RUNTIME.
-
-## 15. Hackathon MVP scope (deadline-driven)
-
-    MUST (demo path):
-      --folder (1-6), --url (1), --auth-bearer, --no-auth, --issue,
-      --dry-run; 4 subagents via Bob Shell; apply -> pytest -> commit;
-      Rich terminal report; culprit serve + watsonx Orchestrate agent (§16).
-
-    STRETCH (only if time remains; keep stubs raising NotImplementedError):
-      --git, --auth-basic, --auth-oauth2, --auth-apikey, --trace.
-
-## 16. watsonx Orchestrate integration (chat-triggered runs)
-
-    culprit serve  -> FastAPI app (src/culprit/server.py), bearer-token protected
-      POST /debug          {issue} -> 202 {job_id}   (Orchestrate tool: start_culprit_debug)
-      GET  /debug/{job_id} -> status + report summary (tool: get_culprit_debug_result)
-      GET  /health
-
-    Asynchronous because a run (~60 s) exceeds Orchestrate's 40 s limit for
-    synchronous tools. One run at a time (409 otherwise).
-    Callers choose ONLY the issue text; the project (demo_workspace/sample_app),
-    live URL and folders are fixed server-side. Each run resets the demo and
-    runs `culprit debug --json-report` as a subprocess (argv list, no shell).
-
-    Orchestrate side (orchestrate/, deployed by scripts/orchestrate_deploy.py):
-      - bearer connection "culprit_api" holding CULPRIT_API_TOKEN
-      - OpenAPI 3.0 tools pointing at a Cloudflare quick tunnel to culprit serve
-      - native agent "culprit_oncall" that starts a run and reports the result
+**Ground rule.** The `/ask` handler retrieves the top-k chunks from `notes/*.json`, hands them to the LLM (Bob or watsonx.ai) with a system prompt that forbids ungrounded answers, and rejects any response whose citations don't match the retrieved chunks. A unit test asserts that a nonsense question ("what is the meaning of life") returns `grounded: false`.
