@@ -38,6 +38,7 @@ from culprit.domain.models import (
     Attempt,
     Bug,
     CulpritReport,
+    Endpoint,
     Fix,
     ReportStatus,
     RootCause,
@@ -72,8 +73,10 @@ class Orchestrator:
         report_builder: ReportBuilder,
         dry_run: bool,
         progress_cb: Callable[[str], None] | None = None,
+        endpoint: Endpoint | None = None,
     ) -> None:
         """Wire all dependencies; no I/O at construction time."""
+        self._endpoint = endpoint
         self._workspace = workspace
         self._factory = factory
         self._watsonx = watsonx_client
@@ -157,10 +160,14 @@ class Orchestrator:
         try:
             # ── a. Optional URL probe ──────────────────────────────────────
             runtime_evidence: RuntimeEvidence | None = None
-            if self._http_client is not None:
-                self._progress_cb("  🌐 Probing live URL…")
-                runtime_evidence = await self._http_client.probe(
-                    bug.runtime_evidence[0].endpoint if bug.runtime_evidence else None  # type: ignore[arg-type]
+            if self._http_client is not None and self._endpoint is not None:
+                self._progress_cb(
+                    f"  🌐 Probing live {self._endpoint.method} {self._endpoint.url}…"
+                )
+                runtime_evidence = await self._http_client.probe(self._endpoint)
+                self._progress_cb(
+                    f"     ↳ HTTP {runtime_evidence.response_status}: "
+                    f"{runtime_evidence.response_body.strip()[:120]}"
                 )
                 subagent_outputs["runtime_evidence"] = runtime_evidence.model_dump()
 

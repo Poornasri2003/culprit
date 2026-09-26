@@ -59,6 +59,7 @@ class Endpoint(BaseModel):
     headers: dict[str, str]
     expected_status: int
     actual_status: Optional[int] = None
+    body: Optional[str] = None  # request body sent when probing (e.g. JSON)
 
 
 class AuthContext(BaseModel):

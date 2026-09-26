@@ -17,6 +17,8 @@ this is the differentiator vs static-only AI debuggers.
 
     Input flags (at least one code source + optionally a live URL):
       --url URL              Live endpoint to probe (repeatable)
+      --method METHOD        HTTP method for the probe (default GET)
+      --body TEXT            Request body for the probe (e.g. JSON)
       --folder PATH          Local code folder (repeatable, 1-6)
       --git URL              Remote repo to clone (repeatable, 1-4)
 

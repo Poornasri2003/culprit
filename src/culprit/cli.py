@@ -51,6 +51,8 @@ def cli() -> None:
 @click.argument("inputs", nargs=-1)
 @click.option("--issue", required=True, help="Bug description.")
 @click.option("--url", multiple=True, help="Live endpoint URL (repeatable, max 3).")
+@click.option("--method", default="GET", show_default=True, help="HTTP method used to probe --url.")
+@click.option("--body", default=None, help="Request body (e.g. JSON) sent when probing --url.")
 @click.option(
     "--folder",
     multiple=True,
@@ -104,6 +106,8 @@ def debug_command(
     inputs: tuple[str, ...],
     issue: str,
     url: tuple[str, ...],
+    method: str,
+    body: Optional[str],
     folder: tuple[str, ...],
     git_urls: tuple[str, ...],
     trace: Optional[str],
@@ -147,19 +151,17 @@ def debug_command(
         except (AuthError, NotImplementedError) as exc:
             console.print(f"[red]Auth error:[/red] {exc}")
             sys.exit(1)
-        endpoint = Endpoint(
+        endpoint: Endpoint | None = Endpoint(
             url=url[0],
-            method="GET",
+            method=method.upper(),
             headers={},
             expected_status=200,
+            body=body,
         )
         http_client = HttpClient(auth_context)
-        # Embed the endpoint into the bug so the orchestrator can probe it
-        from culprit.domain.models import RuntimeEvidence
-        # We'll pass the endpoint through the bug static_evidence; the probe
-        # is done in the orchestrator step (a).
     else:
         auth_context = None
+        endpoint = None
 
     # ── Build domain Bug ──────────────────────────────────────────────────
     static_evidence = list(codebases)
@@ -199,6 +201,7 @@ def debug_command(
         report_builder=report_builder,
         dry_run=dry_run,
         progress_cb=progress,
+        endpoint=endpoint,
     )
 
     # ── Run ───────────────────────────────────────────────────────────────

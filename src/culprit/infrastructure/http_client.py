@@ -57,12 +57,15 @@ class HttpClient:
         Raises UnreachableError on timeout/DNS failure (E8).
         """
         headers = _apply_auth(endpoint.headers, self._auth_context)
+        if endpoint.body is not None and not any(k.lower() == "content-type" for k in headers):
+            headers["Content-Type"] = "application/json"
         t0 = time.monotonic()
         try:
             response = await self._client.request(
                 method=endpoint.method,
                 url=endpoint.url,
                 headers=headers,
+                content=endpoint.body,
             )
         except (httpx.TimeoutException, httpx.ConnectError, httpx.TransportError) as exc:
             raise UnreachableError(
@@ -83,7 +86,7 @@ class HttpClient:
 
         return RuntimeEvidence(
             endpoint=evidence_endpoint,
-            request_body=None,
+            request_body=endpoint.body,
             response_body=response.text,
             response_status=response.status_code,
             latency_ms=latency_ms,
