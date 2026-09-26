@@ -204,21 +204,35 @@ def _mermaid_png_bytes(source: str) -> bytes | None:
     return None
 
 
-def _folder_picker_dialog() -> str | None:
-    """Open a native folder picker on the Streamlit host (works locally).
-    Returns the chosen path, or None if cancelled / unavailable.
+def _folder_picker_dialog() -> tuple[str | None, str | None]:
+    """Open a native folder picker on the Streamlit host machine.
+
+    Returns (chosen_path, error_message). Exactly one is non-None:
+      * (path, None) — a folder was picked
+      * (None, "cancelled") — the dialog opened and the user cancelled
+      * (None, "<other>") — tkinter unavailable, no display, etc.
     """
     try:
         import tkinter as tk
         from tkinter import filedialog
+    except Exception as exc:
+        return None, f"tkinter unavailable: {exc}"
+
+    try:
         root = tk.Tk()
         root.withdraw()
-        root.wm_attributes("-topmost", 1)
-        path = filedialog.askdirectory(master=root, title="Choose a repo folder")
+        # Bring the dialog to the front on Windows. -topmost + focus_force is
+        # the combination that actually works when Streamlit is behind Chrome.
+        root.attributes("-topmost", True)
+        root.after(100, lambda: root.focus_force())
+        path = filedialog.askdirectory(master=root, title="Choose a repo folder for Compass")
         root.destroy()
-        return path or None
-    except Exception:
-        return None
+    except Exception as exc:
+        return None, f"picker failed: {exc}"
+
+    if not path:
+        return None, "cancelled"
+    return path, None
 
 
 def _read(path: Path) -> str:
@@ -378,17 +392,23 @@ with tab_onboard:
                 key="git_url",
             )
         elif src_kind == "Local folder":
-            # The text_input owns the "local_path" widget key. To let the Browse
-            # button also write to it, we mutate session_state inside an
-            # on_click callback that fires BEFORE the widget re-instantiates on
-            # the next rerun (writing to a widget-owned key after instantiation
+            # The text_input owns the "local_path" widget key. To let the
+            # Browse button also write to it we mutate session_state inside an
+            # on_click callback (which fires BEFORE the widget re-instantiates
+            # on the next rerun; writing to a widget-owned key after that
             # raises StreamlitWidgetAlreadyInstantiatedError).
             st.session_state.setdefault("local_path", "")
+            st.session_state.setdefault("last_browse_msg", None)
 
             def _pick_local_folder() -> None:
-                chosen = _folder_picker_dialog()
+                chosen, err = _folder_picker_dialog()
                 if chosen:
                     st.session_state.local_path = chosen
+                    st.session_state.last_browse_msg = ("success", f"Picked: {chosen}")
+                elif err == "cancelled":
+                    st.session_state.last_browse_msg = ("info", "No folder chosen (cancelled).")
+                else:
+                    st.session_state.last_browse_msg = ("error", err or "picker failed")
 
             col_path, col_browse = st.columns([5, 1])
             with col_path:
@@ -404,9 +424,26 @@ with tab_onboard:
                     "📁 Browse…",
                     disabled=running,
                     use_container_width=True,
-                    help="Open a native folder picker on this machine.",
+                    help="Opens on the machine running Streamlit (this laptop). "
+                         "If the dialog does not appear, it may be behind the browser — Alt-Tab.",
                     on_click=_pick_local_folder,
                 )
+            st.caption(
+                "💡 The folder picker opens on **the machine running Streamlit** — "
+                "not on the device you're viewing this page from. "
+                "If a dialog doesn't appear, Alt-Tab to it, or just paste the path directly."
+            )
+            msg = st.session_state.get("last_browse_msg")
+            if msg:
+                level, text = msg
+                if level == "success":
+                    st.success(text, icon="📁")
+                elif level == "info":
+                    st.info(text, icon="ℹ️")
+                else:
+                    st.error(f"Browse failed — {text}. Paste the path directly instead.", icon="⚠️")
+            if st.session_state.local_path:
+                st.caption(f"Current path: `{st.session_state.local_path}`")
         else:
             uploaded = st.file_uploader(
                 "Upload a .zip of the repository",
