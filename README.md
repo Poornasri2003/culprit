@@ -119,10 +119,10 @@ In terminal 2, run the `culprit debug …` command shown at the top of this READ
 
 ## Trigger it from chat with watsonx Orchestrate
 
-An on-call engineer doesn't need a terminal. A **watsonx Orchestrate** agent, `culprit_oncall`, runs Culprit from chat:
+An on-call engineer shouldn't need a terminal. Culprit ships a **watsonx Orchestrate** agent, `culprit_oncall`, with two tools that run Culprit from chat:
 
 > 👤 *"Customers say the cart total is wrong when they use the SAVE10 discount code."*
-> 🤖 *"Culprit started (job 77852e…). … FIXED in 73 s for 0.18 Bobcoins. Root cause: shared/pricing.py line 28. All tests pass, and the fix and regression test are committed (3e6c3f1)."*
+> 🤖 calls `start_culprit_debug`, then `get_culprit_debug_result`, and reports the result.
 
 ```
 Orchestrate chat ─► agent culprit_oncall ─► tools start_culprit_debug / get_culprit_debug_result
@@ -135,18 +135,36 @@ Orchestrate chat ─► agent culprit_oncall ─► tools start_culprit_debug / 
 - It is **bearer-token protected**. Callers choose **only the issue text**: the project, the URL and the folders are fixed on the server side.
 - The Orchestrate developer kit (ADK) lives in its own `.venv-orchestrate/`, apart from Culprit's own dependencies.
 
-Setup, using the free 30-day watsonx Orchestrate trial:
+**What we verified, and what we didn't:**
 
-```bash
-python -m venv .venv-orchestrate && .venv-orchestrate/Scripts/pip install ibm-watsonx-orchestrate
-# .env: WO_INSTANCE_URL and WO_API_KEY (Orchestrate > Settings > API details)
-python scripts/prepare_demo.py && python scripts/run_backend.py      # terminal 1
-python -m culprit serve --port 8080                                   # terminal 2
-cloudflared tunnel --url http://localhost:8080                        # terminal 3, copy the https URL
-python scripts/orchestrate_deploy.py --tunnel-url https://<name>.trycloudflare.com
-```
+| Part | Status |
+|---|---|
+| `culprit serve` and both tool endpoints, called over a public Cloudflare tunnel | ✅ Verified end to end. `start_culprit_debug` returned a job id, and `get_culprit_debug_result` returned FIXED in 73 s for 0.18 Bobcoins with all tests passing |
+| Agent and tool definitions (`orchestrate/`), connection setup and deploy script | ✅ Written against the ADK 2.17 docs. The YAML is validated, and all 12 API tests pass |
+| Deploying the agent into a live Orchestrate instance and chatting with it | ⚠️ **Not run by us**. It needs an Orchestrate API key, which we couldn't generate before the deadline. Follow the steps below with your own instance |
 
-Then open Orchestrate **Chat**, pick **culprit_oncall**, and report the bug.
+### Run it with your own watsonx Orchestrate instance
+
+Prerequisites: the Quick start above works, plus [`cloudflared`](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/) and a watsonx Orchestrate instance. The free 30-day trial works.
+
+1. Get your instance values. In Orchestrate, click the **profile icon**, then **Settings** and **API details**. Copy the **service instance URL** and **Generate API key**. On AWS/MCSP instances, the button opens the IBM SaaS Console: go to **Subscriptions**, then **View instances**, open your instance, and generate the key there.
+2. Put them in `.env`:
+   ```
+   WO_INSTANCE_URL=https://api.<region>.watson-orchestrate.ibm.com/instances/<id>
+   WO_API_KEY=<your Orchestrate API key>
+   ```
+   Note that a Bob API key does **not** work here: Orchestrate returns `Error getting MCSP_V2 Token`.
+3. Run:
+   ```bash
+   python -m venv .venv-orchestrate && .venv-orchestrate/Scripts/pip install ibm-watsonx-orchestrate
+   python scripts/prepare_demo.py && python scripts/run_backend.py      # terminal 1: demo backend
+   python -m culprit serve --port 8080                                   # terminal 2: Culprit API
+   cloudflared tunnel --url http://localhost:8080                        # terminal 3: copy the https URL
+   python scripts/orchestrate_deploy.py --list-models                    # optional: choose a model
+   python scripts/orchestrate_deploy.py --tunnel-url https://<name>.trycloudflare.com [--llm <model>]
+   ```
+   The deploy script connects the ADK to your instance and generates `CULPRIT_API_TOKEN` in `.env` if it is missing. It stores that token in a bearer connection, imports both tools pointing at your tunnel, then imports and deploys the agent.
+4. In Orchestrate, open **Chat**, pick **culprit_oncall**, and report the bug. Ask for the status after about a minute.
 
 ## The demo scenario
 
