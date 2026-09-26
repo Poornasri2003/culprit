@@ -107,7 +107,7 @@ Defined in src/culprit/config.py:
     class CulpritReport:
         status: FIXED | PARTIAL | NEEDS_HUMAN
         bug: Bug
-        root_cause: RootCause
+        root_cause: Optional[RootCause]   # None if run aborted before tracing
         fix: Optional[Fix]
         regression_test: Optional[RegressionTest]
         attempts: list[Attempt]
@@ -119,9 +119,12 @@ Defined in src/culprit/config.py:
 ## 5. Subagents (Strategy pattern; each has a specific output type)
 
     Reproducer(workspace, bug) -> FailingTest
-      * If --url provided: makes real authenticated call, captures
-        RuntimeEvidence, writes pytest test that hits the endpoint
-      * If no --url: writes pytest that invokes the code path directly
+      * If --url provided: the orchestrator has already probed it; the
+        captured RuntimeEvidence is given to Reproducer as context
+      * ALWAYS writes a pytest that exercises the code path IN-PROCESS
+        (e.g. Flask test_client), never the live URL — a running server
+        keeps old code loaded, so a live-URL test cannot see a fix
+      * The bug is "observable" only if this test FAILS on current code
 
     CauseTracer(workspace, bug, runtime_evidence) -> RootCause
       * Walks source code across ALL codebases
@@ -144,14 +147,18 @@ Defined in src/culprit/config.py:
 
     for attempt in range(MAX_ATTEMPTS):
         runtime_evidence = probe_url(url, auth) if url else None
-        parallel_run(4 subagents)
+        parallel_run(Reproducer, CauseTracer)   # both use runtime_evidence
+        if failing_test passes on current code:
+            return NEEDS_HUMAN (BugNotObservable, E9)
         if confidence < CONFIDENCE_FLOOR:
             return NEEDS_HUMAN
-        adjudication = adjudicate(root_cause, fix)   # §12; fail-open
-        if adjudication.verdict == REJECT:
+        candidates = FixAuthor(root_cause)       # up to 3, lowest risk first
+        fix = first candidate whose adjudication == APPROVE   # §12; fail-open
+        if no candidate approved:
             record failure  # reasoning feeds next attempt as context
-            continue        # fix is NEVER applied
-        apply(fix)
+            continue        # no fix is EVER applied without approval
+        regression_test = Guard(root_cause, fix)
+        apply(fix + regression_test)
         result = test_runner.run(all_codebases)
         if result.passed:
             git.commit(fix + regression_test)
@@ -172,8 +179,10 @@ Defined in src/culprit/config.py:
     E6  --dry-run -> subagents run, no apply, no commit
     E7  Auth token acquisition fails -> AuthError -> abort, no partial
     E8  URL unreachable (timeout/DNS) -> UnreachableError -> abort
-    E9  URL returns 200 (bug NOT reproducible) -> BugNotObservable ->
-        NEEDS_HUMAN with a message asking for a better --issue text
+    E9  Reproducer's failing test PASSES on current code (bug not
+        reproducible) -> BugNotObservable -> NEEDS_HUMAN with a message
+        asking for a better --issue text. NOTE: an HTTP 200 alone is NOT
+        E9 — a wrong value returned with 200 is a real bug.
     E10 Bug spans codebases we don't have -> NEEDS_HUMAN with message
         naming the missing codebase
 
@@ -225,8 +234,13 @@ Defined in src/culprit/config.py:
 
 ## 12. watsonx.ai Adjudicator (second opinion)
 
-    Model:    read from WATSONX_MODEL_ID (default ibm/granite-3-8b-instruct;
-              must be available in the user's watsonx.ai project/region)
+    Model:    read from WATSONX_MODEL_ID (a Granite model listed in the
+              hackathon "watsonx Hackathon Sandbox" project, Dallas region).
+              Never llama-3-405b-instruct or mistral-* (out of scope per
+              hackathon guide).
+    Transport: plain REST via httpx (IAM token endpoint + watsonx.ai
+              text/chat endpoint). No ibm-watsonx-ai SDK: keeps deps light
+              and avoids Python-version compatibility risk.
     Endpoint: WATSONX_URL (default https://us-south.ml.cloud.ibm.com)
     Project:  WATSONX_PROJECT_ID
     Auth:     IBM_CLOUD_API_KEY from .env -> IAM token -> watsonx bearer
@@ -284,3 +298,32 @@ Defined in src/culprit/config.py:
 
     Deterministic code: budget, HTTP, git, schema validation, loops,
       adjudication total and verdict.
+
+## 14. Bob runtime integration (how Culprit calls Bob)
+
+    Culprit's subagents call IBM Bob through Bob Shell in non-interactive
+    mode, as a subprocess (bob_client.py):
+
+        bob run --format json --mode <ask|agent> --workspace <path>
+                --max-cost <remaining budget> --accept-license "<prompt>"
+
+    * Auth: Bob Shell's own login (SSO) or BOB_API_KEY in the environment.
+      Culprit never reads, logs or passes BOB_API_KEY itself.
+    * Budget: --max-cost is set per call to
+      MAX_BOBCOIN_PER_RUN - bobcoins_used so far (hard cap enforced by Bob
+      AND by Culprit). Cost per call is read from the JSON output if present.
+    * The target service's AuthContext is NEVER passed to bob_client.
+    * Prerequisite: Node.js >= 24 and Bob Shell installed.
+
+    Bob IDE is used to BUILD Culprit (task sessions exported to
+    bob_sessions/ for judging); Bob Shell is used by Culprit at RUNTIME.
+
+## 15. Hackathon MVP scope (deadline-driven)
+
+    MUST (demo path):
+      --folder (1-6), --url (1), --auth-bearer, --no-auth, --issue,
+      --dry-run; 4 subagents via Bob Shell; watsonx.ai adjudicator
+      (fail-open); apply -> pytest -> commit; Rich terminal report.
+
+    STRETCH (only if time remains; keep stubs raising NotImplementedError):
+      --git, --auth-basic, --auth-oauth2, --auth-apikey, --trace.

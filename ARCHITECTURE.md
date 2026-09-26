@@ -217,6 +217,8 @@ class RegressionTest(BaseModel):
 class TestResult(BaseModel):
     """Outcome of running pytest across all codebases (§6, §9)."""
 
+    __test__ = False  # stop pytest from trying to collect this class
+
     passed: bool
     output: str
     failed_tests: list[str]
@@ -258,7 +260,7 @@ class CulpritReport(BaseModel):
 
     status: ReportStatus
     bug: Bug
-    root_cause: RootCause
+    root_cause: Optional[RootCause] = None  # None if the run aborted before tracing
     fix: Optional[Fix] = None
     regression_test: Optional[RegressionTest] = None
     attempts: list[Attempt]
@@ -306,6 +308,15 @@ class BugNotObservable(CulpritError):
 
 class MissingCodebaseError(CulpritError):
     """Bug spans a codebase not provided to the run (E10)."""
+
+class ConfigurationError(CulpritError):
+    """Required configuration (env var, CLI flag combination) is missing or invalid."""
+
+class WatsonxError(CulpritError):
+    """watsonx.ai call failed (timeout, auth, malformed output); caller fails open (§12)."""
+
+class BobShellError(CulpritError):
+    """Bob Shell subprocess failed to start or exited non-zero (§14)."""
 ```
 
 **Pattern:** Exception hierarchy rooted at `CulpritError` — enables a single
@@ -410,17 +421,18 @@ class SubagentFactory:
 """
 Reproducer subagent — produces a FailingTest (§5).
 
-If a live URL is provided the Reproducer makes an authenticated HTTP call
-via http_client, captures RuntimeEvidence, and writes a pytest that hits
-the endpoint. Without a URL it writes a pytest that invokes the code path
-directly from source.
+If a live URL was provided, the orchestrator has already probed it and
+passes the captured RuntimeEvidence in as context. The Reproducer ALWAYS
+writes a pytest that exercises the code path IN-PROCESS (e.g. Flask
+test_client), never the live URL: a running server keeps old code loaded,
+so a live-URL test could never see the fix (SPEC §5).
 """
 
 from __future__ import annotations
 from dataclasses import dataclass
 
 from culprit.subagents.base import Subagent
-from culprit.domain.models import Bug, RuntimeEvidence, AuthContext
+from culprit.domain.models import Bug, RuntimeEvidence
 
 @dataclass
 class FailingTest:
@@ -441,9 +453,9 @@ class Reproducer(Subagent):
         self,
         *,
         bug: Bug,
-        auth_context: AuthContext | None,
+        runtime_evidence: RuntimeEvidence | None,
     ) -> FailingTest:
-        """Produce a FailingTest; capture RuntimeEvidence when a URL is present."""
+        """Produce an in-process FailingTest, using runtime_evidence as context if present."""
 ```
 
 ---
@@ -489,7 +501,8 @@ class CauseTracer(Subagent):
 FixAuthor subagent — proposes up to 3 ranked candidate patches (§5).
 
 Candidates are ranked by risk: quick patch < proper fix < refactor.
-The orchestrator selects the first candidate that passes adjudication.
+The orchestrator adjudicates candidates in this order and selects the
+first one that is APPROVEd (SPEC §6).
 """
 
 from __future__ import annotations
@@ -595,46 +608,54 @@ details.
 
 ## 12. `src/culprit/infrastructure/bob_client.py`
 
-> Wraps the IBM Bob 2.0 agent API. Implements header redaction per §10.
+> Wraps IBM Bob Shell in non-interactive mode (`bob run --format json`, SPEC §14).
+> Implements header redaction per §10.
 
 ```python
 """
-BobClient — IBM Bob 2.0 adapter with header redaction (§10).
+BobClient — IBM Bob Shell subprocess adapter with header redaction (§10, §14).
 
-Sends structured prompts to Bob subagents and parses the JSON responses.
-Headers matching REDACTED_HEADER_NAMES are stripped before any content
-reaches Bob chat context (§10). Retries once on malformed JSON (E2).
+Runs `bob run --format json --mode <mode> --workspace <path>
+--max-cost <remaining> --accept-license "<prompt>"` via asyncio subprocess
+and parses the JSON result. Headers matching REDACTED_HEADER_NAMES are
+stripped from any context before it is placed in a prompt (§10).
+Retries once on malformed JSON (E2). Bob Shell authenticates itself
+(SSO or BOB_API_KEY); this module never reads or passes that key.
+The target service's AuthContext is never given to this class.
 """
 
 from __future__ import annotations
-from typing import Any
-
-from culprit.domain.models import AuthContext
+from pathlib import Path
+from typing import Any, Literal
 
 class BobClient:
     """
-    Adapter around the IBM Bob 2.0 agent API (§5, §10).
+    Adapter around the Bob Shell CLI (§5, §10, §14).
 
-    Pattern: Adapter — presents a stable async interface; hides Bob
-    session lifecycle and retry logic.
+    Pattern: Adapter — presents a stable async interface; hides subprocess
+    handling, JSON parsing, retry and budget logic.
     """
 
-    def __init__(self, auth_context: AuthContext) -> None:
-        """Initialise with the run's AuthContext; do not open a session yet."""
+    def __init__(self, workspace_root: Path, max_bobcoins: float) -> None:
+        """Store the workspace root and per-run Bobcoin cap; no subprocess yet."""
 
     async def run_agent(
         self,
         prompt: str,
         context: dict[str, Any],
         *,
-        workspace_path: str | None = None,
+        mode: Literal["ask", "agent"] = "ask",
     ) -> dict[str, Any]:
         """
-        Send a prompt to a Bob agent and return the parsed JSON response.
+        Run one `bob run` call and return the parsed JSON object Bob was asked to emit.
 
-        Retries once on malformed JSON before raising SubagentError (E2).
-        Tracks bobcoin usage and raises BudgetExhausted when limit is hit (E4).
+        --max-cost is set to the remaining budget. Retries once on malformed
+        JSON before raising SubagentError (E2). Raises BudgetExhausted when the
+        cap is reached (E4) and BobShellError if the process fails.
         """
+
+    def _build_command(self, prompt: str, mode: str, max_cost: float) -> list[str]:
+        """Return the argv list for `bob run` (no shell string interpolation)."""
 
     def redact_headers(self, headers: dict[str, str]) -> dict[str, str]:
         """Return a copy of headers with REDACTED_HEADER_NAMES values replaced by '<redacted>'."""
@@ -643,7 +664,7 @@ class BobClient:
         """Return cumulative bobcoin spend for the current run."""
 ```
 
-**Pattern:** Adapter — decouples subagents from the Bob SDK.
+**Pattern:** Adapter — decouples subagents from the Bob Shell CLI.
 
 ---
 
@@ -677,9 +698,12 @@ class WatsonxClient:
     def __init__(self) -> None:
         """
         Read WATSONX_URL, WATSONX_PROJECT_ID, WATSONX_MODEL_ID, IBM_CLOUD_API_KEY
-        from environment; raise ConfigurationError if required vars are absent.
-        No network call here.
+        from environment. Never raises: missing vars just make is_configured()
+        False so the orchestrator can fail open (§12). No network call here.
         """
+
+    def is_configured(self) -> bool:
+        """Return True only if all required watsonx env vars are present."""
 
     async def adjudicate(
         self,
@@ -710,7 +734,8 @@ class WatsonxClient:
         """Strip credential-bearing header patterns per REDACTED_HEADER_NAMES (§10)."""
 ```
 
-**Pattern:** Adapter — isolates all watsonx.ai SDK calls.
+**Pattern:** Adapter — isolates all watsonx.ai REST calls (IAM token +
+text/chat endpoint via httpx; no ibm-watsonx-ai SDK, SPEC §12).
 
 > **Key constraint (§6, §12):** `adjudicate()` is called BEFORE `fix` is
 > applied. A REJECT verdict means the fix is never written to disk; its
@@ -726,9 +751,10 @@ class WatsonxClient:
 HttpClient — authenticated HTTP probe adapter (§5, §9).
 
 Makes real HTTP calls to live endpoints. Enforces HTTP_TIMEOUT_SECONDS.
-Captures the full response as RuntimeEvidence. Raises UnreachableError
-on timeout/DNS failure (E8) and BugNotObservable when the endpoint
-returns 200 (E9).
+Captures the full response as RuntimeEvidence whatever the status code.
+Raises UnreachableError on timeout/DNS failure (E8). It does NOT decide
+whether the bug is observable — a wrong value returned with HTTP 200 is a
+real bug; E9 is decided by the Reproducer's failing test (SPEC §7).
 """
 
 from __future__ import annotations
@@ -747,10 +773,9 @@ class HttpClient:
 
     async def probe(self, endpoint: Endpoint) -> RuntimeEvidence:
         """
-        Make an authenticated HTTP call and return RuntimeEvidence.
+        Make an authenticated HTTP call and return RuntimeEvidence (any status).
 
         Raises UnreachableError on timeout/DNS failure (E8).
-        Raises BugNotObservable when the response is HTTP 200 (E9).
         """
 
     async def close(self) -> None:
@@ -833,6 +858,8 @@ class TestRunner:
     Pattern: Adapter — wraps subprocess pytest invocation.
     """
 
+    __test__ = False  # stop pytest from trying to collect this class
+
     def run(self, codebases: list[SourceCodebase]) -> TestResult:
         """
         Invoke pytest in each codebase root; aggregate pass/fail; return TestResult.
@@ -911,10 +938,12 @@ import time
 from pathlib import Path
 
 from culprit.domain.models import (
-    Bug, AuthContext, CulpritReport, Attempt, Adjudication,
-    RootCause, Fix, ReportStatus,
+    Bug, CulpritReport, Attempt, Adjudication,
+    RootCause, Fix, ReportStatus, RuntimeEvidence,
 )
 from culprit.subagents.factory import SubagentFactory
+from culprit.subagents.reproducer import FailingTest
+from culprit.application.report_builder import ReportBuilder
 from culprit.infrastructure.workspace import Workspace
 from culprit.infrastructure.watsonx_client import WatsonxClient
 from culprit.infrastructure.test_runner import TestRunner
@@ -937,11 +966,12 @@ class Orchestrator:
         test_runner: TestRunner,
         git_ops: GitOps,
         http_client: HttpClient | None,
+        report_builder: ReportBuilder,
         dry_run: bool,
     ) -> None:
         """Wire all dependencies; no I/O at construction time."""
 
-    async def run(self, bug: Bug, auth_context: AuthContext) -> CulpritReport:
+    async def run(self, bug: Bug) -> CulpritReport:
         """
         Execute up to MAX_ATTEMPTS of the self-healing loop; return the final CulpritReport.
 
@@ -954,35 +984,40 @@ class Orchestrator:
         self,
         attempt_num: int,
         bug: Bug,
-        auth_context: AuthContext,
         prior_failure: str | None,
     ) -> tuple[Attempt, RootCause | None, Fix | None]:
         """
-        Run one attempt: probe URL, run 4 subagents in parallel, return partial results.
+        Run one attempt in SPEC §6 order: probe URL -> Reproducer ‖ CauseTracer
+        -> FixAuthor -> adjudicate candidates -> Guard -> apply -> test.
 
-        Returns a tuple of (Attempt, RootCause, selected Fix); Fix is None on REJECT.
+        Returns a tuple of (Attempt, RootCause, selected Fix); Fix is None if none approved.
         """
 
-    async def _run_subagents_parallel(
+    async def _reproduce_and_trace(
         self,
         bug: Bug,
-        auth_context: AuthContext,
-    ) -> tuple["FailingTest", RootCause, list[Fix]]:
-        """Launch Reproducer, CauseTracer, FixAuthor concurrently via anyio; return outputs."""
+        runtime_evidence: RuntimeEvidence | None,
+        prior_failure: str | None,
+    ) -> tuple[FailingTest, RootCause]:
+        """Run Reproducer and CauseTracer concurrently via anyio (the only parallel step)."""
 
-    def _select_fix(self, candidates: list[Fix]) -> Fix:
-        """Return the lowest-risk fix candidate (index 0 from FixAuthor ranking)."""
+    async def _select_approved_fix(
+        self,
+        root_cause: RootCause,
+        candidates: list[Fix],
+    ) -> tuple[Fix | None, list[Adjudication]]:
+        """Adjudicate candidates lowest-risk first; return the first APPROVEd fix (or None) and all verdicts."""
 
-    def _adjudicate(
+    async def _adjudicate(
         self,
         root_cause: RootCause,
         fix: Fix,
         source_context: str,
     ) -> Adjudication | None:
         """
-        Call WatsonxClient.adjudicate; return None on any infrastructure failure (fail-open, §12).
+        Await WatsonxClient.adjudicate; return None on any WatsonxError or if not configured (fail-open, §12).
 
-        Sets report.adjudicator_available = False when returning None.
+        Calls report_builder.set_adjudicator_available(False) when returning None.
         """
 
     def _build_source_context(self, root_cause: RootCause) -> str:
@@ -1127,24 +1162,31 @@ everything internal is hidden behind `Orchestrator`.
 The following sequence is **invariant** — enforced in `Orchestrator._run_attempt()`:
 
 ```
-subagents complete
+probe --url (optional) ──> RuntimeEvidence
        │
        ▼
-confidence >= CONFIDENCE_FLOOR ?  ──No──> NEEDS_HUMAN
+Reproducer ‖ CauseTracer             # the only parallel step
+       │
+failing test FAILS on current code ? ──No──> NEEDS_HUMAN (E9)
+       │ Yes
+confidence >= CONFIDENCE_FLOOR ?     ──No──> NEEDS_HUMAN (E5)
        │ Yes
        ▼
-adjudicate(root_cause, fix)          # watsonx.ai call; fail-open
+FixAuthor ──> up to 3 candidates, lowest risk first
        │
-       ├─ REJECT ──> record reasoning as Attempt.failure_reason
-       │              feed reasoning to next attempt; fix NOT applied
+adjudicate each in order             # watsonx.ai call; fail-open
        │
-       └─ APPROVE ──> apply(fix)
-                       test_runner.run()
-                             │
-                     passed ─┴─ failed
-                        │              │
-                    commit           revert
-                    FIXED        record failure
+       ├─ none APPROVEd ──> record last reasoning as Attempt.failure_reason
+       │                    feed to next attempt; NOTHING applied
+       │
+       └─ first APPROVE ──> Guard writes regression test
+                             apply(fix + test)
+                             test_runner.run()
+                                   │
+                           passed ─┴─ failed
+                              │              │
+                          commit           revert
+                          FIXED        record failure
 ```
 
 On `--dry-run`: adjudication still runs and its result is recorded, but the
@@ -1175,7 +1217,9 @@ strip headers whose lowercased name appears in `config.REDACTED_HEADER_NAMES`.
 |----------------------|-----------|-------------------------------|
 | `AuthError`          | E7        | Abort immediately, no report  |
 | `UnreachableError`   | E8        | Abort immediately, no report  |
-| `BugNotObservable`   | E9        | `NEEDS_HUMAN` + message       |
+| `BugNotObservable`   | E9        | `NEEDS_HUMAN` + message (raised by orchestrator when the failing test passes) |
+| `WatsonxError`       | §12       | Fail open: `adjudicator_available=False`, continue |
+| `BobShellError`      | §14       | Record failure; next attempt  |
 | `MissingCodebaseError`| E10      | `NEEDS_HUMAN` + message       |
 | `BudgetExhausted`    | E4        | `PARTIAL`                     |
 | `SubagentError`      | E2        | Record failure; next attempt  |

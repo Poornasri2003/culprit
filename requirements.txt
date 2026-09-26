@@ -32,6 +32,5 @@ structlog>=24.1
 pytest-mock>=3.12
 pytest-asyncio>=0.23
 
-# watsonx.ai Adjudicator (SPEC section 12)
-ibm-watsonx-ai>=1.1.0
-ibm-cloud-sdk-core>=3.20.0
+# watsonx.ai Adjudicator (SPEC section 12): plain REST via httpx (above),
+# no ibm-watsonx-ai SDK needed
