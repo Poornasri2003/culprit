@@ -1,2 +1,0 @@
-[console_scripts]
-culprit = culprit.cli:cli
