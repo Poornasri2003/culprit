@@ -29,6 +29,28 @@ def _backup_dir(root: Path) -> Path:
     return Path(tempfile.gettempdir()) / "culprit_backup" / key
 
 
+
+def _read_exact(path: Path) -> str:
+    """Read a file without newline translation, so CRLF files stay CRLF."""
+    with open(path, encoding="utf-8", newline="") as fh:
+        return fh.read()
+
+
+def _write_exact(path: Path, content: str) -> None:
+    """Write a file without newline translation (inverse of _read_exact)."""
+    with open(path, "w", encoding="utf-8", newline="") as fh:
+        fh.write(content)
+
+
+def _match_newlines(snippet: str, file_text: str) -> str:
+    """Give an edit snippet the same line endings as the file it targets.
+
+    Bob answers with LF line endings; a CRLF file would otherwise never
+    match, or be rewritten with mixed endings (a whole-file diff).
+    """
+    snippet = snippet.replace("\r\n", "\n")
+    return snippet.replace("\n", "\r\n") if "\r\n" in file_text else snippet
+
 class GitOps:
     """
     Adapter for git operations during the self-healing loop (§6, §9).
@@ -54,8 +76,8 @@ class GitOps:
         # ── Validation pass: check every edit before touching any file ──
         for edit in fix.edits:
             target = root / edit.file
-            original = target.read_text(encoding="utf-8")
-            occurrences = original.count(edit.old_text)
+            original = _read_exact(target)
+            occurrences = original.count(_match_newlines(edit.old_text, original))
             if occurrences != 1:
                 raise SubagentError(
                     f"old_text for '{edit.file}' occurs {occurrences} time(s); "
@@ -78,15 +100,19 @@ class GitOps:
 
         for edit in fix.edits:
             target = root / edit.file
-            original = target.read_text(encoding="utf-8")
-            new_content = original.replace(edit.old_text, edit.new_text, 1)
+            original = _read_exact(target)
+            new_content = original.replace(
+                _match_newlines(edit.old_text, original),
+                _match_newlines(edit.new_text, original),
+                1,
+            )
 
-            target.write_text(new_content, encoding="utf-8")
+            _write_exact(target, new_content)
             applied.append(edit.file)
 
             diff = difflib.unified_diff(
-                original.splitlines(keepends=True),
-                new_content.splitlines(keepends=True),
+                original.replace("\r\n", "\n").splitlines(keepends=True),
+                new_content.replace("\r\n", "\n").splitlines(keepends=True),
                 fromfile=f"a/{edit.file}",
                 tofile=f"b/{edit.file}",
             )
@@ -121,17 +147,22 @@ class GitOps:
         codebase: SourceCodebase,
         fix: Fix,
         regression_test: RegressionTest | None,
+        project_root: Path | None = None,
     ) -> str:
         """Stage fix + regression test files and create a commit; return the commit SHA."""
         repo = gitpython.Repo(str(codebase.root_path), search_parent_directories=True)
 
-        files_to_stage: list[str] = list(fix.applied_files)
-        if regression_test is not None:
-            files_to_stage.append(regression_test.file)
-
-        for rel_path in files_to_stage:
+        # Stage the fix files (relative to codebase root)
+        for rel_path in fix.applied_files:
             abs_path = str(codebase.root_path / rel_path)
             repo.index.add([abs_path])
+
+        # Stage the regression test — its path is relative to project_root when supplied,
+        # otherwise fall back to codebase root (original behaviour).
+        if regression_test is not None:
+            reg_root = project_root if project_root is not None else codebase.root_path
+            abs_reg = str(reg_root / regression_test.file)
+            repo.index.add([abs_reg])
 
         commit_message = (
             f"culprit: fix {fix.target_codebase}\n\n"

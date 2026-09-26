@@ -55,38 +55,35 @@ def _bob_argv() -> list[str]:
 
 def _extract_json(text: str) -> dict[str, Any] | list[Any]:
     """
-    Extract the first complete JSON object or array from *text* using
-    raw_decode, starting at whichever of '{' or '[' appears first.
+    Return the largest JSON object or array embedded in *text*.
 
-    Raises ValueError if no valid JSON is found.
+    Bob often writes prose (with markdown links such as "[f()](a.py:9)" or
+    inline braces) before the answer, so the first "{" or "[" is not
+    necessarily the start of the answer. Every candidate start position is
+    tried with raw_decode; the decode spanning the most characters wins.
+
+    Raises ValueError if no valid JSON object or array is found.
     """
-    # Find the earliest start position for either a JSON object or array.
-    candidates: list[int] = []
-    for ch in ("{", "["):
-        idx = text.find(ch)
-        if idx != -1:
-            candidates.append(idx)
-    if not candidates:
-        raise ValueError(f"No JSON object or array found in text: {text!r}")
-
-    start = min(candidates)
-    try:
-        obj, _ = json.JSONDecoder().raw_decode(text, start)
-        return obj  # type: ignore[return-value]
-    except json.JSONDecodeError:
-        pass
-
-    # Fallback: try the other start character if the first failed
-    for ch in ("{", "["):
-        idx = text.find(ch)
-        if idx != -1 and idx != start:
-            try:
-                obj, _ = json.JSONDecoder().raw_decode(text, idx)
-                return obj  # type: ignore[return-value]
-            except json.JSONDecodeError:
-                continue
-
-    raise ValueError(f"No JSON object or array found in text: {text!r}")
+    decoder = json.JSONDecoder()
+    best: dict[str, Any] | list[Any] | None = None
+    best_span = 0
+    pos = 0
+    while True:
+        starts = [i for i in (text.find("{", pos), text.find("[", pos)) if i != -1]
+        if not starts:
+            break
+        start = min(starts)
+        try:
+            obj, end = decoder.raw_decode(text, start)
+        except json.JSONDecodeError:
+            pos = start + 1
+            continue
+        if isinstance(obj, (dict, list)) and end - start > best_span:
+            best, best_span = obj, end - start
+        pos = end
+    if best is None:
+        raise ValueError(f"No JSON object or array found in text: {text[:200]!r}")
+    return best
 
 
 class BobClient:

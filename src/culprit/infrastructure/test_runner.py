@@ -86,6 +86,47 @@ class TestRunner:
             failed_tests=failed,
         )
 
+    def run_single(self, test_file: Path, cwd: Path | None = None) -> TestResult:
+        """
+        Invoke pytest on a single file; return TestResult.
+
+        Used by the orchestrator to check whether the repro test actually fails.
+        Never raises — failures are expressed through TestResult.passed.
+        """
+        try:
+            result = subprocess.run(
+                [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", str(test_file)],
+                # Run from the project root so its conftest.py (sys.path setup) loads.
+                cwd=str(cwd or test_file.parent),
+                capture_output=True,
+                text=True,
+                timeout=_PYTEST_TIMEOUT_SECONDS,
+            )
+        except subprocess.TimeoutExpired:
+            return TestResult(
+                passed=False,
+                output=f"[single] pytest timed out on {test_file.name}\n",
+                failed_tests=[],
+            )
+        except Exception as exc:  # noqa: BLE001
+            return TestResult(
+                passed=False,
+                output=f"[single] Failed to run pytest on {test_file.name}: {exc}\n",
+                failed_tests=[],
+            )
+
+        combined = result.stdout + result.stderr
+        failed = [
+            line[len("FAILED "):].strip()
+            for line in combined.splitlines()
+            if line.startswith("FAILED ")
+        ]
+        return TestResult(
+            passed=result.returncode == 0,
+            output=f"[single]\n{combined}",
+            failed_tests=failed,
+        )
+
     def has_tests(self, codebase: SourceCodebase) -> bool:
         """Return True if the codebase contains at least one pytest-discoverable test file."""
         return self._has_test_files(codebase.root_path)

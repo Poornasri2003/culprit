@@ -43,7 +43,7 @@ Root cause:
   explanation: {root_cause.explanation}
 
 Fix applied in codebase: {fix.target_codebase!r}
-Files changed: {fix.applied_files}
+Files changed (relative to that codebase root): {sorted({e.file for e in fix.edits}) or fix.applied_files}
 
 Available codebases (name -> root path):
 {codebase_list}
@@ -52,8 +52,9 @@ Instructions:
 - READ the source code carefully; do NOT modify any production file or the fix itself.
 - Write a pytest that would have caught this bug BEFORE the fix was applied.
 - Use in-process testing only (e.g. Flask test_client). Never call a live URL.
-- The test file must be named test_culprit_regression.py and placed inside the existing tests folder of the codebase.
-- The file path must be relative to the codebase root.
+- The test file must be named test_culprit_regression.py and placed inside the existing tests folder.
+- The file path must be relative to the WORKSPACE ROOT (the folder containing all codebases), e.g. "tests/test_culprit_regression.py".
+- pytest runs from the workspace root, where an existing conftest.py already puts the workspace root on sys.path. FIRST read an existing test file in that tests folder and import production code EXACTLY the way it does (e.g. "from shared.pricing import ..." or "from backend.app import app"). Do NOT modify sys.path.
 - The test function must be a stable, permanent test (not just reproducing the bug, but verifying correct behaviour).
 - Reply with ONLY a single JSON object — no prose, no markdown fences — in this exact shape:
   {{

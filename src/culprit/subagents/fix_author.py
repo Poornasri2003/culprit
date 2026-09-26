@@ -68,6 +68,15 @@ Instructions:
   ]"""
 
         result = await self._bob_client.run_agent(prompt, {}, mode="ask")
+        # Bob's reply shape varies between runs: accept a bare list, a single
+        # candidate object, or an object wrapping the list (e.g. "candidates").
+        if isinstance(result, dict):
+            if "edits" in result:
+                result = [result]
+            else:
+                wrapped = [v for v in result.values() if isinstance(v, list)]
+                if wrapped:
+                    result = wrapped[0]
         if not isinstance(result, list):
             raise SubagentError(f"FixAuthor: expected list, got {type(result).__name__}")
         fixes: list[Fix] = []

@@ -78,8 +78,10 @@ Instructions:
 - READ the source code carefully; do NOT modify any production file.
 - Write a pytest that FAILS on the current code and PASSES once the bug is fixed.
 - Use in-process testing only (e.g. Flask test_client). Never call a live URL.
-- The test file must be named test_culprit_repro.py and placed inside the existing tests folder of the relevant codebase.
-- The file path must be relative to the codebase root.
+- The test file must be named test_culprit_repro.py and placed inside the existing tests folder.
+- The file path must be relative to the WORKSPACE ROOT (the folder containing all codebases), e.g. "tests/test_culprit_repro.py".
+- pytest runs from the workspace root, where an existing conftest.py already puts the workspace root on sys.path. FIRST read an existing test file in that tests folder and import production code EXACTLY the way it does. Do NOT modify sys.path.
+- The test must fail on an ASSERTION about the wrong value, never on an import or setup error.
 - Reply with ONLY a single JSON object — no prose, no markdown fences — in this exact shape:
   {{"file": "<relative/path/to/test_culprit_repro.py>", "code": "<full test file content>"}}"""
 

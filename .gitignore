@@ -120,3 +120,6 @@ build/
 # ============================================
 # Python packaging build output
 *.egg-info/
+
+# Culprit demo runs (own git repo, recreated by scripts/prepare_demo.py)
+demo_workspace/
