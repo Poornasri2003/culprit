@@ -3,7 +3,7 @@
 Usage:
     python scripts/orchestrate_deploy.py --tunnel-url https://<name>.trycloudflare.com
     python scripts/orchestrate_deploy.py --list-models          # pick an --llm
-    python scripts/orchestrate_deploy.py --tunnel-url ... --llm watsonx/ibm/granite-...
+    python scripts/orchestrate_deploy.py --tunnel-url ... --llm <model from --list-models>
 
 Needs in .env (never printed):
     WO_INSTANCE_URL    watsonx Orchestrate > Settings > API details > service instance URL

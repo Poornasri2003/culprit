@@ -21,8 +21,6 @@ from dotenv import load_dotenv
 from rich.console import Console
 from rich.panel import Panel
 from rich.syntax import Syntax
-from rich.table import Table
-from rich import box
 
 from culprit.config import MAX_BOBCOIN_PER_RUN, MAX_CODEBASES, MAX_URLS
 from culprit.domain.exceptions import AuthError, UnreachableError
@@ -33,7 +31,6 @@ from culprit.infrastructure.test_runner import project_root
 from culprit.infrastructure.git_ops import GitOps
 from culprit.infrastructure.http_client import HttpClient
 from culprit.infrastructure.test_runner import TestRunner
-from culprit.infrastructure.watsonx_client import WatsonxClient
 from culprit.infrastructure.workspace import Workspace
 from culprit.subagents.factory import SubagentFactory
 from culprit.application.orchestrator import Orchestrator
@@ -196,7 +193,6 @@ def debug_command(
         max_bobcoins=MAX_BOBCOIN_PER_RUN,
     )
     factory = SubagentFactory(workspace, bob_client)
-    watsonx_client = WatsonxClient()
     test_runner = TestRunner()
     git_ops = GitOps()
     report_builder = ReportBuilder(bug)
@@ -211,7 +207,6 @@ def debug_command(
     orchestrator = Orchestrator(
         workspace=workspace,
         factory=factory,
-        watsonx_client=watsonx_client,
         test_runner=test_runner,
         git_ops=git_ops,
         http_client=http_client,
@@ -275,29 +270,6 @@ def _render_report(report: CulpritReport, run_start: float) -> None:
                 border_style="green",
             )
         )
-
-    # Adjudication table
-    if report.adjudications:
-        table = Table(title="Adjudication scores", box=box.SIMPLE)
-        table.add_column("#", style="dim")
-        table.add_column("Correctness")
-        table.add_column("Safety")
-        table.add_column("Minimalism")
-        table.add_column("Total")
-        table.add_column("Verdict")
-        for i, adj in enumerate(report.adjudications, 1):
-            verdict_style = "green" if adj.verdict.value == "APPROVE" else "red"
-            table.add_row(
-                str(i),
-                f"{adj.correctness_score:.2f}",
-                f"{adj.safety_score:.2f}",
-                f"{adj.minimalism_score:.2f}",
-                f"{adj.total_score:.2f}",
-                f"[{verdict_style}]{adj.verdict.value}[/{verdict_style}]",
-            )
-        console.print(table)
-    elif not report.adjudicator_available:
-        console.print("  Adjudicator:  [dim]watsonx not configured[/dim]")
 
     # Test result
     if report.attempts:

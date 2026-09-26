@@ -76,7 +76,6 @@ class DebugResult(BaseModel):
     tests_passed: Optional[bool] = None
     commit_sha: Optional[str] = None
     bobcoins_used: Optional[float] = None
-    adjudicator_available: Optional[bool] = None
     summary: str
 
 
@@ -180,7 +179,6 @@ def _summarise(job: _Job) -> DebugResult:
     result.tests_passed = last_test.get("passed") if last_test else None
     result.commit_sha = r.get("commit_sha")
     result.bobcoins_used = round(float(r.get("bobcoins_used", 0.0)), 3)
-    result.adjudicator_available = r.get("adjudicator_available")
     if result.culprit_status == "FIXED":
         result.summary = (
             f"FIXED in {r.get('elapsed_seconds', 0):.0f}s for {result.bobcoins_used} Bobcoins. "

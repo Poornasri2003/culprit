@@ -6,7 +6,7 @@ You give Culprit a running endpoint, the code folders behind it, and one sentenc
 
 1. It **probes the live endpoint** to capture real runtime evidence, meaning the actual response.
 2. It **reproduces** the bug as a failing pytest and **traces** the root cause across all the codebases.
-3. It **writes candidate fixes**, which a second model (watsonx.ai Granite) can review before anything is applied.
+3. It **writes up to three candidate fixes**, ranked from lowest to highest risk, and takes the lowest-risk one.
 4. It **applies the fix, runs the full test suite**, and **commits** the fix together with a permanent regression test. If the tests fail, it reverts the fix and tries again.
 
 ```
@@ -63,11 +63,9 @@ Most AI debuggers only read code. Many real bugs, though, are only visible at ru
  │                                                                            │
  │ 4. SUBAGENT FixAuthor ──► up to 3 fixes (exact search/replace edits)       │
  │                                                                            │
- │ 5. ADJUDICATOR watsonx.ai Granite scores each fix  (optional, fail-open)   │
+ │ 5. SUBAGENT Guard ──► permanent regression test                            │
  │                                                                            │
- │ 6. SUBAGENT Guard ──► permanent regression test                            │
- │                                                                            │
- │ 7. TOOL GitOps.apply ─► TOOL TestRunner (all tests) ─► TOOL GitOps.commit  │
+ │ 6. TOOL GitOps.apply ─► TOOL TestRunner (all tests) ─► TOOL GitOps.commit  │
  │                                  └── tests fail? GitOps.revert, retry      │
  └────────────────────────────────────────────────────────────────────────────┘
           │ each SUBAGENT = one headless IBM Bob run
@@ -87,12 +85,11 @@ Most AI debuggers only read code. Many real bugs, though, are only visible at ru
 | **Subagent** | One specialist job given to Bob: **Reproducer**, **CauseTracer**, **FixAuthor** or **Guard**. Each gets its own prompt and returns strict JSON | IBM Bob, through Bob Shell |
 | **Tool** (Culprit) | Plain-code actions the orchestrator uses: `HttpClient` (probe the live URL), `TestRunner` (pytest), `GitOps` (apply, revert, commit) | Python |
 | **Tool** (Bob) | Bob's built-in abilities during a subagent run: list, read and search files. They're read-only in ask mode | IBM Bob |
-| **Adjudicator** | A second AI opinion that scores each fix. The final verdict is computed by code | watsonx.ai Granite |
 
 | Part | What decides | Why |
 |---|---|---|
 | Reproducer, CauseTracer, FixAuthor, Guard | **IBM Bob**, called headless through Bob Shell (`bob run --format json --mode ask`) | Reading several repositories, mapping an HTTP response to source lines, writing tests and edits |
-| Adjudicator | **watsonx.ai Granite** scores correctness, safety and minimalism; **code** computes the total and the APPROVE or REJECT verdict | An independent second opinion on Bob's fix |
+| Keep or revert a fix | **The test suite**: the repro test must fail before the fix, and every test must pass after it | An objective judge that needs no second model |
 | Loop, budget, HTTP, auth, applying edits, tests, git | **Plain Python**, with no AI involved | These steps must be predictable and auditable |
 
 Culprit's safety rules:
@@ -119,10 +116,6 @@ In terminal 2, run the `culprit debug …` command shown at the top of this READ
 - Add `--dry-run` to analyse and review the fix without applying or committing anything.
 - Leave out `--url` to debug from code alone.
 - Run `python scripts/prepare_demo.py` again to reset the demo.
-
-### Optional: the watsonx.ai adjudicator
-
-Set `IBM_CLOUD_API_KEY`, `WATSONX_PROJECT_ID`, `WATSONX_URL` and `WATSONX_MODEL_ID` in `.env`. Without these values, Culprit prints "watsonx not configured" and continues, so the adjudicator never blocks a run.
 
 ## Trigger it from chat with watsonx Orchestrate
 
@@ -177,8 +170,8 @@ src/culprit/
   application/                orchestrator.py (the loop), report_builder.py
   domain/                     Pydantic models and exceptions
   subagents/                  Reproducer, CauseTracer, FixAuthor, Guard (Strategy) and their factory
-  infrastructure/             bob_client, watsonx_client, http_client, auth, workspace, test_runner, git_ops
-tests/                        162 unit tests, with no network, no Bob and no cost
+  infrastructure/             bob_client, http_client, auth, workspace, test_runner, git_ops
+tests/                        127 unit tests, with no network, no Bob and no cost
 sample_app/                   the demo app with its seeded bug
 scripts/                      prepare_demo.py, run_backend.py, orchestrate_deploy.py
 orchestrate/                  Orchestrate agent and OpenAPI tool definitions
@@ -196,7 +189,7 @@ Culprit was designed and built in the **Bob IDE**, one task per layer:
 2. The sample app
 3. The domain models
 4. The infrastructure
-5. The watsonx client
+5. A watsonx.ai reviewer client (later removed, since no IBM Cloud account was available)
 6. Bob Shell and the subagents
 7. The orchestrator and CLI
 

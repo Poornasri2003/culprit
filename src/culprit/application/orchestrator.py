@@ -2,9 +2,9 @@
 Orchestrator — the self-healing debug loop (§6).
 
 Controls the attempt loop up to MAX_ATTEMPTS, runs the four subagents
-(concurrently via anyio), calls the watsonx.ai Adjudicator before every
-fix application, applies or reverts fixes, runs tests, and accumulates
-Attempt records.
+(Reproducer and CauseTracer concurrently via anyio), applies the
+lowest-risk fix candidate, runs the tests, commits or reverts, and
+accumulates Attempt records. The test suite is the judge of every fix.
 
 All hard limits (MAX_ATTEMPTS, CONFIDENCE_FLOOR, etc.) are enforced here
 deterministically — never delegated to AI (§9).
@@ -30,11 +30,8 @@ from culprit.domain.exceptions import (
     BugNotObservable,
     MissingCodebaseError,
     SubagentError,
-    WatsonxError,
 )
 from culprit.domain.models import (
-    Adjudication,
-    AdjudicationVerdict,
     Attempt,
     Bug,
     CulpritReport,
@@ -48,7 +45,6 @@ from culprit.domain.models import (
 from culprit.infrastructure.git_ops import GitOps
 from culprit.infrastructure.http_client import HttpClient
 from culprit.infrastructure.test_runner import TestRunner, project_root
-from culprit.infrastructure.watsonx_client import WatsonxClient
 from culprit.infrastructure.workspace import Workspace
 from culprit.subagents.factory import SubagentFactory
 from culprit.subagents.reproducer import FailingTest
@@ -66,7 +62,6 @@ class Orchestrator:
         self,
         workspace: Workspace,
         factory: SubagentFactory,
-        watsonx_client: WatsonxClient,
         test_runner: TestRunner,
         git_ops: GitOps,
         http_client: HttpClient | None,
@@ -79,7 +74,6 @@ class Orchestrator:
         self._endpoint = endpoint
         self._workspace = workspace
         self._factory = factory
-        self._watsonx = watsonx_client
         self._test_runner = test_runner
         self._git_ops = git_ops
         self._http_client = http_client
@@ -95,9 +89,9 @@ class Orchestrator:
         """
         Execute up to MAX_ATTEMPTS of the self-healing loop; return the final CulpritReport.
 
-        Adjudication runs before every fix application (§6, §12).
-        A REJECT verdict prevents apply; reasoning feeds the next attempt.
-        On --dry-run: adjudication still runs; nothing is applied or committed (E6).
+        A fix is committed only if the whole test suite passes; otherwise it is
+        reverted and the failure feeds the next attempt.
+        On --dry-run: the proposed fix is reported; nothing is applied or committed (E6).
         """
         wall_start = time.monotonic()
         codebases = self._workspace.get_codebases()
@@ -219,34 +213,20 @@ class Orchestrator:
                 _safe_delete(repro_file_path)
                 return attempt, ReportStatus.NEEDS_HUMAN, None
 
-            # ── e. FixAuthor + Adjudication ───────────────────────────────
+            # ── e. FixAuthor: take the lowest-risk candidate ──────────────
             self._progress_cb("  ✏️  Running FixAuthor…")
             fix_author = self._factory.make_fix_author()
             candidates = await fix_author.run(root_cause=root_cause, prior_failure=prior_failure)
             subagent_outputs["fix_candidates"] = len(candidates)
-
-            approved_fix, adjudications, last_reasoning = await self._select_approved_fix(
-                root_cause=root_cause, candidates=candidates
-            )
-            for adj in adjudications:
-                self._report_builder.add_adjudication(adj)
-
-            if approved_fix is None:
-                self._progress_cb("  ❌ All fix candidates rejected")
-                attempt = Attempt(
-                    num=attempt_num,
-                    subagent_outputs=subagent_outputs,
-                    failure_reason=last_reasoning or "All candidates rejected",
-                )
-                _safe_delete(repro_file_path)
-                return attempt, None, None  # try next attempt
-
-            subagent_outputs["approved_fix"] = approved_fix.target_codebase
+            # Candidates arrive ranked lowest-risk first (quick patch < proper
+            # fix < refactor); the test suite below decides whether it stays.
+            selected_fix = candidates[0]
+            subagent_outputs["selected_fix"] = selected_fix.target_codebase
 
             # ── f. dry-run: stop here ─────────────────────────────────────
             if self._dry_run:
                 self._progress_cb("  🌵 --dry-run: stopping before apply")
-                self._report_builder.set_fix(approved_fix)
+                self._report_builder.set_fix(selected_fix)
                 attempt = Attempt(
                     num=attempt_num,
                     subagent_outputs=subagent_outputs,
@@ -257,7 +237,7 @@ class Orchestrator:
             # ── g. Guard + apply ──────────────────────────────────────────
             self._progress_cb("  🛡  Running Guard…")
             guard = self._factory.make_guard()
-            regression_test = await guard.run(root_cause=root_cause, fix=approved_fix)
+            regression_test = await guard.run(root_cause=root_cause, fix=selected_fix)
             subagent_outputs["regression_test"] = regression_test.file
 
             regression_test.file = _contained_test_path(proj_root, regression_test.file)
@@ -266,9 +246,9 @@ class Orchestrator:
             regression_file_path.write_text(regression_test.code, encoding="utf-8")
 
             # Apply the fix
-            target_codebase = _find_codebase(codebases, approved_fix.target_codebase)
+            target_codebase = _find_codebase(codebases, selected_fix.target_codebase)
             self._progress_cb("  🔧 Applying fix…")
-            self._git_ops.apply_fix(target_codebase, approved_fix)
+            self._git_ops.apply_fix(target_codebase, selected_fix)
 
             # ── h. Run tests ──────────────────────────────────────────────
             self._progress_cb("  🧪 Running full test suite…")
@@ -280,17 +260,17 @@ class Orchestrator:
                 repro_file_path = None
 
                 self._progress_cb("  ✅ Tests passed — committing…")
-                self._report_builder.set_fix(approved_fix)
+                self._report_builder.set_fix(selected_fix)
                 self._report_builder.set_regression_test(regression_test)
                 try:
                     commit_sha = self._git_ops.commit(
-                        target_codebase, approved_fix, regression_test, proj_root
+                        target_codebase, selected_fix, regression_test, proj_root
                     )
                     # The regression test is now committed: keep it on disk.
                     regression_file_path = None
                 except Exception:
                     # Never leave a half-applied fix behind.
-                    self._git_ops.revert_fix(target_codebase, approved_fix)
+                    self._git_ops.revert_fix(target_codebase, selected_fix)
                     raise
                 attempt = Attempt(
                     num=attempt_num,
@@ -301,7 +281,7 @@ class Orchestrator:
             else:
                 # Tests failed — revert and record failure
                 self._progress_cb("  ❌ Tests failed — reverting fix…")
-                self._git_ops.revert_fix(target_codebase, approved_fix)
+                self._git_ops.revert_fix(target_codebase, selected_fix)
                 failure_reason = f"Tests failed: {', '.join(test_result.failed_tests[:5])}"
                 attempt = Attempt(
                     num=attempt_num,
@@ -399,68 +379,6 @@ class Orchestrator:
             raise group.exceptions[0] from None
 
         return failing_test_holder[0], root_cause_holder[0]
-
-    # -----------------------------------------------------------------------
-    # Adjudication
-    # -----------------------------------------------------------------------
-
-    async def _select_approved_fix(
-        self,
-        root_cause: RootCause,
-        candidates: list[Fix],
-    ) -> tuple[Fix | None, list[Adjudication], str | None]:
-        """
-        Adjudicate candidates lowest-risk first.
-        Returns (first_approved_fix_or_None, all_adjudications, last_reasoning).
-        """
-        adjudications: list[Adjudication] = []
-        last_reasoning: str | None = None
-
-        for candidate in candidates:
-            adj = await self._adjudicate(root_cause, candidate)
-            if adj is not None:
-                adjudications.append(adj)
-                last_reasoning = adj.reasoning
-                if adj.verdict == AdjudicationVerdict.APPROVE:
-                    return candidate, adjudications, last_reasoning
-            else:
-                # Watsonx not configured / error → fail-open: take this candidate
-                self._progress_cb("  ⚠️  Adjudicator unavailable — failing open")
-                return candidate, adjudications, None
-
-        return None, adjudications, last_reasoning
-
-    async def _adjudicate(
-        self,
-        root_cause: RootCause,
-        fix: Fix,
-    ) -> Adjudication | None:
-        """
-        Await WatsonxClient.adjudicate; return None on any WatsonxError or if not configured.
-        Calls report_builder.set_adjudicator_available(False) when returning None.
-        """
-        if not self._watsonx.is_configured():
-            self._report_builder.set_adjudicator_available(False)
-            return None
-
-        source_context = self._build_source_context(root_cause)
-        try:
-            return await self._watsonx.adjudicate(root_cause, fix, source_context)
-        except WatsonxError:
-            self._report_builder.set_adjudicator_available(False)
-            return None
-
-    def _build_source_context(self, root_cause: RootCause) -> str:
-        """Assemble redacted source context lines around root_cause.file:line."""
-        try:
-            abs_path = self._workspace.resolve_file(root_cause.codebase, root_cause.file)
-            lines = abs_path.read_text(encoding="utf-8").splitlines()
-            start = max(0, root_cause.line - 10)
-            end = min(len(lines), root_cause.line + 10)
-            context_lines = lines[start:end]
-            return "\n".join(context_lines)
-        except (KeyError, OSError):
-            return ""
 
 
 # ---------------------------------------------------------------------------

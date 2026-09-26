@@ -43,7 +43,6 @@ components:
         tests_passed: {type: boolean}
         commit_sha: {type: string}
         bobcoins_used: {type: number}
-        adjudicator_available: {type: boolean}
         summary: {type: string, description: One-paragraph human-readable result.}
 paths:
   /debug:

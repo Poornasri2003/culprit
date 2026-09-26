@@ -10,7 +10,6 @@ from __future__ import annotations
 import time
 
 from culprit.domain.models import (
-    Adjudication,
     Attempt,
     Bug,
     CulpritReport,
@@ -34,20 +33,14 @@ class ReportBuilder:
         self._bug = bug
         self._start_time = time.monotonic()
         self._attempts: list[Attempt] = []
-        self._adjudications: list[Adjudication] = []
         self._root_cause: RootCause | None = None
         self._fix: Fix | None = None
         self._regression_test: RegressionTest | None = None
-        self._adjudicator_available: bool = True
         self._bobcoins_used: float = 0.0
 
     def add_attempt(self, attempt: Attempt) -> None:
         """Append an Attempt record to the accumulator."""
         self._attempts.append(attempt)
-
-    def add_adjudication(self, adjudication: Adjudication) -> None:
-        """Append an Adjudication record to the accumulator."""
-        self._adjudications.append(adjudication)
 
     def set_root_cause(self, root_cause: RootCause) -> None:
         """Record the confirmed RootCause for the report."""
@@ -60,10 +53,6 @@ class ReportBuilder:
     def set_regression_test(self, regression_test: RegressionTest) -> None:
         """Record the regression test written by Guard."""
         self._regression_test = regression_test
-
-    def set_adjudicator_available(self, available: bool) -> None:
-        """Record whether watsonx.ai was reachable during this run."""
-        self._adjudicator_available = available
 
     def set_bobcoins_used(self, amount: float) -> None:
         """Record the final bobcoin consumption from BobClient."""
@@ -81,6 +70,4 @@ class ReportBuilder:
             attempts=list(self._attempts),
             elapsed_seconds=elapsed,
             bobcoins_used=self._bobcoins_used,
-            adjudications=list(self._adjudications),
-            adjudicator_available=self._adjudicator_available,
         )

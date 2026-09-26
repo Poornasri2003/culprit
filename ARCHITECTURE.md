@@ -9,8 +9,8 @@
 
 ```
 ┌──────────────────────────────────────────────────┐
-│  Presentation   src/culprit/cli.py               │
-│  (Click, thin wrapper — §2)                      │
+│  Presentation   src/culprit/cli.py  server.py    │
+│  (Click CLI; FastAPI for Orchestrate — §2, §16)  │
 ├──────────────────────────────────────────────────┤
 │  Application    src/culprit/application/         │
 │    orchestrator.py   report_builder.py           │
@@ -18,7 +18,7 @@
 ├──────────────────────────────────────────────────┤
 │  Domain         src/culprit/domain/              │
 │    models.py    exceptions.py                    │
-│  (Pydantic models, domain exceptions — §4, §12)  │
+│  (Pydantic models, domain exceptions — §4)       │
 ├──────────────────────────────────────────────────┤
 │  Subagents      src/culprit/subagents/           │
 │    base.py  factory.py  reproducer.py            │
@@ -26,13 +26,13 @@
 │  (Strategy pattern, Bob-backed — §5)             │
 ├──────────────────────────────────────────────────┤
 │  Infrastructure src/culprit/infrastructure/      │
-│    workspace.py  bob_client.py  watsonx_client.py│
+│    workspace.py  bob_client.py                   │
 │    http_client.py  auth.py  test_runner.py       │
 │    git_ops.py                                    │
-│  (I/O, external services — §9, §10, §12)         │
+│  (I/O, external services — §9, §10, §14)         │
 ├──────────────────────────────────────────────────┤
 │  Config         src/culprit/config.py            │
-│  (All hard constants — §3, §12)                  │
+│  (All hard constants — §3)                       │
 └──────────────────────────────────────────────────┘
 ```
 
@@ -40,7 +40,7 @@
 
 | Layer          | Pattern(s)                              |
 |----------------|-----------------------------------------|
-| Presentation   | Facade (CLI hides all complexity)       |
+| Presentation   | Facade (CLI and HTTP API hide complexity) |
 | Application    | Orchestrator, Builder                   |
 | Domain         | Value Object (Pydantic models), enum    |
 | Subagents      | Strategy (interchangeable agents)       |
@@ -51,16 +51,14 @@
 
 ## 2. `src/culprit/config.py`
 
-> All hard limits from §3 and all watsonx constants from §12.
+> All hard limits from §3.
 > Nothing is hardcoded elsewhere.
 
 ```python
 """
 Culprit configuration constants.
 
-All hard limits (§3) and watsonx.ai Adjudicator settings (§12) live here.
-Model IDs and watsonx coordinates are read from environment variables;
-this module provides only the defaults and the numeric thresholds.
+All hard limits (§3) live here.
 No credentials are stored here.
 """
 
@@ -75,24 +73,12 @@ CONFIDENCE_FLOOR: float
 HTTP_TIMEOUT_SECONDS: int
 AUTH_TOKEN_TTL_SECONDS: int
 
-# §12 — watsonx.ai Adjudicator
-ADJUDICATION_THRESHOLD: float    # total_score below this -> REJECT
-WATSONX_TIMEOUT_SECONDS: int
-WATSONX_MAX_RETRIES: int
-
-# §12 — env-var names (defaults supplied; never the actual credential values)
-WATSONX_MODEL_ID_ENV: str        # env var name; default value "ibm/granite-3-8b-instruct"
-WATSONX_URL_ENV: str             # env var name; default value "https://us-south.ml.cloud.ibm.com"
-WATSONX_PROJECT_ID_ENV: str      # env var name; no default
-IBM_CLOUD_API_KEY_ENV: str       # env var name; no default
-
 # Redacted header names (§10)
 REDACTED_HEADER_NAMES: frozenset[str]  # {"authorization", "x-api-key", "cookie"}
 ```
 
 **Pattern:** Singleton module-level constants — imported directly, never
-instantiated. All env-var names (not values) are also here so the rest of
-the codebase has a single authoritative list.
+instantiated.
 
 ---
 
@@ -106,8 +92,7 @@ Culprit domain models (Pydantic v2).
 
 Defines the canonical data shapes for all Culprit concepts:
 Endpoint, AuthContext, RuntimeEvidence, SourceCodebase, Bug,
-RootCause, Fix, RegressionTest, Attempt, CulpritReport (§4),
-and Adjudication (§12).
+RootCause, Fix, RegressionTest, Attempt, CulpritReport (§4).
 
 These models are the only permitted way to pass structured data
 between layers. Credentials (tokens) are present as Optional fields
@@ -136,11 +121,6 @@ class ReportStatus(str, Enum):
     FIXED        = "FIXED"
     PARTIAL      = "PARTIAL"
     NEEDS_HUMAN  = "NEEDS_HUMAN"
-
-class AdjudicationVerdict(str, Enum):
-    """Deterministic verdict produced by code from total_score (§12)."""
-    APPROVE = "APPROVE"
-    REJECT  = "REJECT"
 
 # ── §4 Models ────────────────────────────────────────────────────────────────
 
@@ -199,12 +179,20 @@ class RootCause(BaseModel):
     explanation: str
     confidence: float  # 0.0 – 1.0
 
+class FileEdit(BaseModel):
+    """One exact search-and-replace edit (old_text must occur exactly once)."""
+
+    file: str
+    old_text: str
+    new_text: str
+
 class Fix(BaseModel):
     """A single candidate patch produced by FixAuthor (§4)."""
 
     target_codebase: str
-    unified_diff: str
-    applied_files: list[str]
+    edits: list[FileEdit]
+    unified_diff: str = ""            # generated by GitOps.apply_fix (difflib)
+    applied_files: list[str] = []
 
 class RegressionTest(BaseModel):
     """A pytest that would have caught this bug, written by Guard (§4)."""
@@ -231,31 +219,11 @@ class Attempt(BaseModel):
     test_result: Optional[TestResult] = None
     failure_reason: Optional[str] = None
 
-# ── §12 Model ────────────────────────────────────────────────────────────────
-
-class Adjudication(BaseModel):
-    """
-    watsonx.ai Adjudicator result for one fix candidate (§12).
-
-    correctness_score, safety_score, minimalism_score, and reasoning
-    come from the model. total_score and verdict are computed by code.
-    """
-
-    correctness_score: float   # 0.0 – 1.0, from model
-    safety_score: float        # 0.0 – 1.0, from model
-    minimalism_score: float    # 0.0 – 1.0, from model
-    total_score: float         # mean of three axes, computed by code
-    verdict: AdjudicationVerdict   # threshold compare, computed by code
-    reasoning: str             # from model
-
 # ── §4 Top-level report ──────────────────────────────────────────────────────
 
 class CulpritReport(BaseModel):
     """
-    Final output of a Culprit debug run (§4, §12).
-
-    adjudications collects every Adjudication produced across all attempts.
-    adjudicator_available is False when watsonx.ai was unreachable (§12).
+    Final output of a Culprit debug run (§4).
     """
 
     status: ReportStatus
@@ -266,8 +234,7 @@ class CulpritReport(BaseModel):
     attempts: list[Attempt]
     elapsed_seconds: float
     bobcoins_used: float
-    adjudications: list[Adjudication]
-    adjudicator_available: bool
+    commit_sha: Optional[str] = None  # set when status is FIXED
 ```
 
 **Pattern:** Value Object — models carry data only; all computation lives in
@@ -311,9 +278,6 @@ class MissingCodebaseError(CulpritError):
 
 class ConfigurationError(CulpritError):
     """Required configuration (env var, CLI flag combination) is missing or invalid."""
-
-class WatsonxError(CulpritError):
-    """watsonx.ai call failed (timeout, auth, malformed output); caller fails open (§12)."""
 
 class BobShellError(CulpritError):
     """Bob Shell subprocess failed to start or exited non-zero (§14)."""
@@ -501,8 +465,8 @@ class CauseTracer(Subagent):
 FixAuthor subagent — proposes up to 3 ranked candidate patches (§5).
 
 Candidates are ranked by risk: quick patch < proper fix < refactor.
-The orchestrator adjudicates candidates in this order and selects the
-first one that is APPROVEd (SPEC §6).
+The orchestrator applies the lowest-risk candidate; the test suite decides
+whether it is committed (SPEC §6, §12).
 """
 
 from __future__ import annotations
@@ -668,79 +632,49 @@ class BobClient:
 
 ---
 
-## 13. `src/culprit/infrastructure/watsonx_client.py`
+## 13. `src/culprit/server.py` (HTTP API for watsonx Orchestrate)
 
-> Adjudicator adapter per §12. Computes `total_score` and `verdict` deterministically.
+> Presentation layer like cli.py. Lets the watsonx Orchestrate agent (SPEC §16)
+> trigger Culprit. Replaces the removed watsonx.ai adjudicator adapter.
 
 ```python
 """
-WatsonxClient — watsonx.ai Adjudicator adapter (§12).
+Culprit HTTP API: POST /debug starts a run, GET /debug/{job_id} returns the
+status and report summary, GET /health is a liveness check.
 
-Reads model ID and coordinates from environment variables (via config.py).
-Sends (root_cause, fix, source_context) to the Granite model and parses
-the three axis scores. Computes total_score and verdict deterministically.
-Applies the same header redaction as bob_client (§10).
-Never logs or exposes credentials.
+Asynchronous because a run (~60 s) exceeds Orchestrate's 40 s limit for
+synchronous tools. Bearer-token protected (CULPRIT_API_TOKEN). Callers choose
+only the issue text; the project, live URL and folders are fixed server-side.
+One run at a time; each run is `python -m culprit debug --json-report` in a
+subprocess (argv list, no shell).
 """
 
-from __future__ import annotations
+class DebugRequest(BaseModel):
+    issue: str                       # 5-500 chars; the only caller input
 
-from culprit.domain.models import RootCause, Fix, Adjudication
+class DebugStarted(BaseModel):
+    job_id: str
+    status: Literal["running"]
+    message: str
 
-class WatsonxClient:
-    """
-    Adapter for the watsonx.ai Adjudicator (§12).
+class DebugResult(BaseModel):
+    job_id: str
+    status: Literal["running", "done", "error"]
+    elapsed_seconds: float
+    progress: list[str]              # live step lines
+    culprit_status: Optional[str]    # FIXED / PARTIAL / NEEDS_HUMAN
+    root_cause: Optional[str]
+    fix_diff: Optional[str]
+    tests_passed: Optional[bool]
+    commit_sha: Optional[str]
+    bobcoins_used: Optional[float]
+    summary: str
 
-    Pattern: Adapter — hides IAM token acquisition, HTTP transport, and
-    retry logic behind adjudicate().
-    """
-
-    def __init__(self) -> None:
-        """
-        Read WATSONX_URL, WATSONX_PROJECT_ID, WATSONX_MODEL_ID, IBM_CLOUD_API_KEY
-        from environment. Never raises: missing vars just make is_configured()
-        False so the orchestrator can fail open (§12). No network call here.
-        """
-
-    def is_configured(self) -> bool:
-        """Return True only if all required watsonx env vars are present."""
-
-    async def adjudicate(
-        self,
-        root_cause: RootCause,
-        fix: Fix,
-        source_context: str,
-    ) -> Adjudication:
-        """
-        Call the Granite model; compute total_score and verdict; return Adjudication.
-
-        source_context has already been redacted by the caller.
-        Retries once on malformed model output, then raises WatsonxError (§12).
-        Raises WatsonxError on timeout or auth failure — caller proceeds fail-open.
-        """
-
-    def _compute_total_score(
-        self,
-        correctness: float,
-        safety: float,
-        minimalism: float,
-    ) -> float:
-        """Return the arithmetic mean of the three axis scores (§12)."""
-
-    def _compute_verdict(self, total_score: float) -> "AdjudicationVerdict":
-        """Return APPROVE if total_score >= ADJUDICATION_THRESHOLD, else REJECT (§12)."""
-
-    def _redact(self, source_context: str) -> str:
-        """Strip credential-bearing header patterns per REDACTED_HEADER_NAMES (§10)."""
+def create_app(runner=_run_culprit) -> FastAPI:
+    """Build the app; `runner` is injectable so tests never call Bob."""
 ```
 
-**Pattern:** Adapter — isolates all watsonx.ai REST calls (IAM token +
-text/chat endpoint via httpx; no ibm-watsonx-ai SDK, SPEC §12).
-
-> **Key constraint (§6, §12):** `adjudicate()` is called BEFORE `fix` is
-> applied. A REJECT verdict means the fix is never written to disk; its
-> `reasoning` is stored as `Attempt.failure_reason` and fed to the next
-> attempt as context.
+**Pattern:** Facade + asynchronous job queue (single worker).
 
 ---
 
@@ -917,57 +851,34 @@ class GitOps:
 
 ## 18. `src/culprit/application/orchestrator.py`
 
-> Implements the self-healing loop from §6. Calls adjudication BEFORE applying
-> any fix.
+> Implements the self-healing loop from §6. The test suite decides whether a
+> fix is kept (SPEC §12).
 
 ```python
 """
 Orchestrator — the self-healing debug loop (§6).
 
 Controls the attempt loop up to MAX_ATTEMPTS, runs the four subagents
-(concurrently via anyio), calls the watsonx.ai Adjudicator before every
-fix application, applies or reverts fixes, runs tests, and accumulates
-Attempt records.
+(Reproducer and CauseTracer concurrently via anyio), applies the
+lowest-risk fix candidate, runs the tests, commits or reverts, and
+accumulates Attempt records. The test suite is the judge of every fix.
 
 All hard limits (MAX_ATTEMPTS, CONFIDENCE_FLOOR, etc.) are enforced here
 deterministically — never delegated to AI (§9).
 """
 
-from __future__ import annotations
-import time
-from pathlib import Path
-
-from culprit.domain.models import (
-    Bug, CulpritReport, Attempt, Adjudication,
-    RootCause, Fix, ReportStatus, RuntimeEvidence,
-)
-from culprit.subagents.factory import SubagentFactory
-from culprit.subagents.reproducer import FailingTest
-from culprit.application.report_builder import ReportBuilder
-from culprit.infrastructure.workspace import Workspace
-from culprit.infrastructure.watsonx_client import WatsonxClient
-from culprit.infrastructure.test_runner import TestRunner
-from culprit.infrastructure.git_ops import GitOps
-from culprit.infrastructure.http_client import HttpClient
-
 class Orchestrator:
-    """
-    Controls the full Culprit self-healing loop (§6).
-
-    Pattern: Orchestrator — coordinates subagents, infrastructure, and
-    domain rules without embedding any business logic inside adapters.
-    """
-
     def __init__(
         self,
         workspace: Workspace,
         factory: SubagentFactory,
-        watsonx_client: WatsonxClient,
         test_runner: TestRunner,
         git_ops: GitOps,
         http_client: HttpClient | None,
         report_builder: ReportBuilder,
         dry_run: bool,
+        progress_cb: Callable[[str], None] | None = None,
+        endpoint: Endpoint | None = None,
     ) -> None:
         """Wire all dependencies; no I/O at construction time."""
 
@@ -975,22 +886,23 @@ class Orchestrator:
         """
         Execute up to MAX_ATTEMPTS of the self-healing loop; return the final CulpritReport.
 
-        Adjudication runs before every fix application (§6, §12).
-        A REJECT verdict prevents apply; reasoning feeds the next attempt.
-        On --dry-run: adjudication still runs; nothing is applied or committed (E6).
+        A fix is committed only if the whole test suite passes; otherwise it is
+        reverted and the failure feeds the next attempt.
+        On --dry-run: the proposed fix is reported; nothing is applied or committed (E6).
         """
 
     async def _run_attempt(
         self,
         attempt_num: int,
         bug: Bug,
+        codebases: list[SourceCodebase],
         prior_failure: str | None,
-    ) -> tuple[Attempt, RootCause | None, Fix | None]:
+    ) -> tuple[Attempt, ReportStatus | None, str | None]:
         """
         Run one attempt in SPEC §6 order: probe URL -> Reproducer ‖ CauseTracer
-        -> FixAuthor -> adjudicate candidates -> Guard -> apply -> test.
-
-        Returns a tuple of (Attempt, RootCause, selected Fix); Fix is None if none approved.
+        -> repro must fail (E9) -> confidence floor (E5) -> FixAuthor (take the
+        lowest-risk candidate) -> Guard -> apply -> full test suite ->
+        commit or revert. Returns (Attempt, final status or None, commit SHA).
         """
 
     async def _reproduce_and_trace(
@@ -1000,35 +912,6 @@ class Orchestrator:
         prior_failure: str | None,
     ) -> tuple[FailingTest, RootCause]:
         """Run Reproducer and CauseTracer concurrently via anyio (the only parallel step)."""
-
-    async def _select_approved_fix(
-        self,
-        root_cause: RootCause,
-        candidates: list[Fix],
-    ) -> tuple[Fix | None, list[Adjudication]]:
-        """Adjudicate candidates lowest-risk first; return the first APPROVEd fix (or None) and all verdicts."""
-
-    async def _adjudicate(
-        self,
-        root_cause: RootCause,
-        fix: Fix,
-        source_context: str,
-    ) -> Adjudication | None:
-        """
-        Await WatsonxClient.adjudicate; return None on any WatsonxError or if not configured (fail-open, §12).
-
-        Calls report_builder.set_adjudicator_available(False) when returning None.
-        """
-
-    def _build_source_context(self, root_cause: RootCause) -> str:
-        """Assemble redacted source context lines around root_cause.file:line for the adjudicator."""
-
-    def _determine_final_status(
-        self,
-        attempts: list[Attempt],
-        adjudications: list[Adjudication],
-    ) -> ReportStatus:
-        """Return FIXED, PARTIAL, or NEEDS_HUMAN based on attempt outcomes (§6, §7)."""
 ```
 
 **Pattern:** Orchestrator — single class owns the loop, delegates I/O and AI
@@ -1051,7 +934,7 @@ import time
 
 from culprit.domain.models import (
     Bug, RootCause, Fix, RegressionTest, Attempt,
-    Adjudication, CulpritReport, ReportStatus,
+    CulpritReport, ReportStatus,
 )
 
 class ReportBuilder:
@@ -1068,9 +951,6 @@ class ReportBuilder:
     def add_attempt(self, attempt: Attempt) -> None:
         """Append an Attempt record to the accumulator."""
 
-    def add_adjudication(self, adjudication: Adjudication) -> None:
-        """Append an Adjudication record to the accumulator."""
-
     def set_root_cause(self, root_cause: RootCause) -> None:
         """Record the confirmed RootCause for the report."""
 
@@ -1079,9 +959,6 @@ class ReportBuilder:
 
     def set_regression_test(self, regression_test: RegressionTest) -> None:
         """Record the regression test written by Guard."""
-
-    def set_adjudicator_available(self, available: bool) -> None:
-        """Record whether watsonx.ai was reachable during this run."""
 
     def set_bobcoins_used(self, amount: float) -> None:
         """Record the final bobcoin consumption from BobClient."""
@@ -1157,9 +1034,9 @@ everything internal is hidden behind `Orchestrator`.
 
 ---
 
-## 21. Adjudication flow (§6 constraint re-stated)
+## 21. Fix flow (§6, §12 re-stated)
 
-The following sequence is **invariant** — enforced in `Orchestrator._run_attempt()`:
+The following sequence is **invariant**, enforced in `Orchestrator._run_attempt()`:
 
 ```
 probe --url (optional) ──> RuntimeEvidence
@@ -1172,25 +1049,20 @@ failing test FAILS on current code ? ──No──> NEEDS_HUMAN (E9)
 confidence >= CONFIDENCE_FLOOR ?     ──No──> NEEDS_HUMAN (E5)
        │ Yes
        ▼
-FixAuthor ──> up to 3 candidates, lowest risk first
+FixAuthor ──> up to 3 candidates, lowest risk first; take candidate 0
        │
-adjudicate each in order             # watsonx.ai call; fail-open
+Guard writes regression test
+apply(fix + test)
+test_runner.run()  (whole suite)
        │
-       ├─ none APPROVEd ──> record last reasoning as Attempt.failure_reason
-       │                    feed to next attempt; NOTHING applied
-       │
-       └─ first APPROVE ──> Guard writes regression test
-                             apply(fix + test)
-                             test_runner.run()
-                                   │
-                           passed ─┴─ failed
-                              │              │
-                          commit           revert
-                          FIXED        record failure
+ passed ─┴─ failed
+    │              │
+ commit          revert, record failing tests
+ FIXED           -> next attempt (max MAX_ATTEMPTS)
 ```
 
-On `--dry-run`: adjudication still runs and its result is recorded, but the
-`apply(fix)` and `commit` branches are skipped (E6, §12).
+On `--dry-run`: the proposed fix is reported, but `apply(fix)` and `commit`
+are skipped (E6).
 
 ---
 
@@ -1202,12 +1074,12 @@ On `--dry-run`: adjudication still runs and its result is recorded, but the
 | `AuthContext.token` (in-memory)         | Yes                 |
 | `AuthContext` serialised to JSON/report | **No** (`exclude=True`) |
 | Bob chat context / prompt               | **No** (redacted)   |
-| watsonx.ai prompt / source context      | **No** (redacted)   |
+| culprit serve API response              | **No**              |
 | Log lines                               | **No**              |
 | `CulpritReport` (written to disk/stdout)| **No**              |
 
-`redact_headers()` in `BobClient` and `_redact()` in `WatsonxClient` both
-strip headers whose lowercased name appears in `config.REDACTED_HEADER_NAMES`.
+`redact_headers()` in `BobClient` and the HTTP probe both strip headers
+whose lowercased name appears in `config.REDACTED_HEADER_NAMES`.
 
 ---
 
@@ -1218,12 +1090,11 @@ strip headers whose lowercased name appears in `config.REDACTED_HEADER_NAMES`.
 | `AuthError`          | E7        | Abort immediately, no report  |
 | `UnreachableError`   | E8        | Abort immediately, no report  |
 | `BugNotObservable`   | E9        | `NEEDS_HUMAN` + message (raised by orchestrator when the failing test passes) |
-| `WatsonxError`       | §12       | Fail open: `adjudicator_available=False`, continue |
 | `BobShellError`      | §14       | Record failure; next attempt  |
 | `MissingCodebaseError`| E10      | `NEEDS_HUMAN` + message       |
 | `BudgetExhausted`    | E4        | `PARTIAL`                     |
 | `SubagentError`      | E2        | Record failure; next attempt  |
-| All attempts REJECT  | E11       | `NEEDS_HUMAN` + last reasoning|
+| Tests fail after fix | —         | Revert; failing tests feed next attempt |
 | No tests found       | E1        | Skip Guard; `PARTIAL`         |
 
 ---

@@ -3,8 +3,7 @@ Culprit domain models (Pydantic v2).
 
 Defines the canonical data shapes for all Culprit concepts:
 Endpoint, AuthContext, RuntimeEvidence, SourceCodebase, Bug,
-RootCause, Fix, RegressionTest, Attempt, CulpritReport (§4),
-and Adjudication (§12).
+RootCause, Fix, RegressionTest, Attempt, CulpritReport (§4).
 
 These models are the only permitted way to pass structured data
 between layers. Credentials (tokens) are present as Optional fields
@@ -39,13 +38,6 @@ class ReportStatus(str, Enum):
     FIXED = "FIXED"
     PARTIAL = "PARTIAL"
     NEEDS_HUMAN = "NEEDS_HUMAN"
-
-
-class AdjudicationVerdict(str, Enum):
-    """Deterministic verdict produced by code from total_score (§12)."""
-
-    APPROVE = "APPROVE"
-    REJECT = "REJECT"
 
 
 # ── §4 Models ────────────────────────────────────────────────────────────────
@@ -162,42 +154,11 @@ class Attempt(BaseModel):
     failure_reason: Optional[str] = None
 
 
-# ── §12 Model ────────────────────────────────────────────────────────────────
-
-
-class Adjudication(BaseModel):
-    """
-    watsonx.ai Adjudicator result for one fix candidate (§12).
-
-    correctness_score, safety_score, minimalism_score, and reasoning
-    come from the model. total_score and verdict are computed by code.
-    """
-
-    correctness_score: float  # 0.0 – 1.0, from model
-    safety_score: float       # 0.0 – 1.0, from model
-    minimalism_score: float   # 0.0 – 1.0, from model
-    total_score: float        # mean of three axes, computed by code
-    verdict: AdjudicationVerdict   # threshold compare, computed by code
-    reasoning: str            # from model
-
-    @field_validator("correctness_score", "safety_score", "minimalism_score", "total_score")
-    @classmethod
-    def _score_range(cls, v: float) -> float:
-        if not 0.0 <= v <= 1.0:
-            raise ValueError(f"Score must be between 0.0 and 1.0, got {v}")
-        return v
-
-
 # ── §4 Top-level report ──────────────────────────────────────────────────────
 
 
 class CulpritReport(BaseModel):
-    """
-    Final output of a Culprit debug run (§4, §12).
-
-    adjudications collects every Adjudication produced across all attempts.
-    adjudicator_available is False when watsonx.ai was unreachable (§12).
-    """
+    """Final output of a Culprit debug run (§4)."""
 
     status: ReportStatus
     bug: Bug
@@ -207,6 +168,4 @@ class CulpritReport(BaseModel):
     attempts: list[Attempt]
     elapsed_seconds: float
     bobcoins_used: float
-    adjudications: list[Adjudication]
-    adjudicator_available: bool
     commit_sha: Optional[str] = None  # set when status is FIXED

@@ -2,8 +2,8 @@
 FixAuthor subagent — proposes up to 3 ranked candidate patches (§5).
 
 Candidates are ranked by risk: quick patch < proper fix < refactor.
-The orchestrator adjudicates candidates in this order and selects the
-first one that is APPROVEd (SPEC §6).
+The orchestrator applies the lowest-risk candidate; the test suite decides
+whether it is committed (SPEC §6).
 """
 
 from __future__ import annotations

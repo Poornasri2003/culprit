@@ -39,9 +39,5 @@ class ConfigurationError(CulpritError):
     """Required configuration (env var, CLI flag combination) is missing or invalid."""
 
 
-class WatsonxError(CulpritError):
-    """watsonx.ai call failed (timeout, auth, malformed output); caller fails open (§12)."""
-
-
 class BobShellError(CulpritError):
     """Bob Shell subprocess failed to start or exited non-zero (§14)."""

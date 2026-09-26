@@ -23,7 +23,6 @@ FIXED_REPORT = {
     "commit_sha": "e8b856f2120510cc",
     "bobcoins_used": 0.2091,
     "elapsed_seconds": 62.8,
-    "adjudicator_available": False,
 }
 
 

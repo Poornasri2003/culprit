@@ -1,14 +1,13 @@
 """
 Tests for the Orchestrator (new Part 4).
 
-Fake subagents / fake watsonx / fake GitOps — no real Bob, no network.
+Fake subagents / fake GitOps — no real Bob, no network.
 Covers:
-  - FIXED path: repro fails → confidence OK → adjudicate APPROVE → tests pass → commit
+  - FIXED path: repro fails → confidence OK → lowest-risk fix → tests pass → commit
   - E9 path: repro test passes on current code → NEEDS_HUMAN
   - E5 path: confidence below floor → NEEDS_HUMAN
-  - REJECT-all path: all candidates rejected → loops, exhausts attempts → NEEDS_HUMAN
-  - Fail-open path: watsonx not configured → take candidate 0 → FIXED
-  - dry-run: adjudicate runs but nothing applied or committed
+  - Candidate selection: the lowest-risk (first) candidate is applied
+  - dry-run: nothing applied or committed
   - Temp test files are always deleted even on errors
 """
 
@@ -24,10 +23,8 @@ import anyio
 from culprit.application.orchestrator import Orchestrator
 from culprit.application.report_builder import ReportBuilder
 from culprit.config import CONFIDENCE_FLOOR
-from culprit.domain.exceptions import SubagentError, WatsonxError
+from culprit.domain.exceptions import SubagentError
 from culprit.domain.models import (
-    Adjudication,
-    AdjudicationVerdict,
     Bug,
     FileEdit,
     Fix,
@@ -39,7 +36,6 @@ from culprit.domain.models import (
 )
 from culprit.infrastructure.git_ops import GitOps
 from culprit.infrastructure.test_runner import TestRunner
-from culprit.infrastructure.watsonx_client import WatsonxClient
 from culprit.infrastructure.workspace import Workspace
 from culprit.subagents.factory import SubagentFactory
 from culprit.subagents.reproducer import FailingTest
@@ -114,28 +110,6 @@ def failing_test_obj() -> FailingTest:
     )
 
 
-def _approve_adjudication() -> Adjudication:
-    return Adjudication(
-        correctness_score=0.9,
-        safety_score=0.9,
-        minimalism_score=0.9,
-        total_score=0.9,
-        verdict=AdjudicationVerdict.APPROVE,
-        reasoning="Looks good",
-    )
-
-
-def _reject_adjudication() -> Adjudication:
-    return Adjudication(
-        correctness_score=0.3,
-        safety_score=0.3,
-        minimalism_score=0.3,
-        total_score=0.3,
-        verdict=AdjudicationVerdict.REJECT,
-        reasoning="Dangerous change",
-    )
-
-
 def _make_orchestrator(
     workspace: Workspace,
     bug: Bug,
@@ -146,9 +120,6 @@ def _make_orchestrator(
     regression_test: RegressionTest,
     repro_passes: bool = False,   # True → E9
     tests_pass: bool = True,
-    watsonx_configured: bool = True,
-    watsonx_verdict: AdjudicationVerdict = AdjudicationVerdict.APPROVE,
-    watsonx_raises: bool = False,
     dry_run: bool = False,
     tmp_path: Path | None = None,
 ) -> tuple[Orchestrator, MagicMock, MagicMock, MagicMock]:
@@ -200,16 +171,6 @@ def _make_orchestrator(
     mock_test_runner.run_single.return_value = repro_result
     mock_test_runner.run.return_value = full_result
 
-    # --- Fake watsonx ---
-    mock_watsonx = MagicMock(spec=WatsonxClient)
-    mock_watsonx.is_configured.return_value = watsonx_configured
-    if watsonx_raises:
-        mock_watsonx.adjudicate = AsyncMock(side_effect=WatsonxError("unavailable"))
-    elif watsonx_verdict == AdjudicationVerdict.APPROVE:
-        mock_watsonx.adjudicate = AsyncMock(return_value=_approve_adjudication())
-    else:
-        mock_watsonx.adjudicate = AsyncMock(return_value=_reject_adjudication())
-
     # --- Report builder ---
     report_builder = ReportBuilder(bug)
 
@@ -218,7 +179,6 @@ def _make_orchestrator(
     orchestrator = Orchestrator(
         workspace=workspace,
         factory=mock_factory,
-        watsonx_client=mock_watsonx,
         test_runner=mock_test_runner,
         git_ops=mock_git_ops,
         http_client=None,
@@ -283,21 +243,25 @@ class TestFixedPath:
         assert git_ops.apply_fix.called
 
     @pytest.mark.asyncio
-    async def test_adjudication_recorded(
+    async def test_lowest_risk_candidate_is_applied(
         self, workspace, bug, root_cause, good_fix, regression_test_obj, failing_test_obj, tmp_path
     ):
+        riskier_fix = Fix(
+            target_codebase="myapp",
+            edits=[FileEdit(file="app.py", old_text="total = price - discount", new_text="total = refactored()")],
+        )
         orch, factory, git_ops, test_runner = _make_orchestrator(
             workspace, bug,
             failing_test=failing_test_obj,
             root_cause=root_cause,
-            fixes=[good_fix],
+            fixes=[good_fix, riskier_fix],
             regression_test=regression_test_obj,
             tests_pass=True,
             tmp_path=tmp_path,
         )
-        report = await orch.run(bug)
-        assert len(report.adjudications) >= 1
-        assert report.adjudications[0].verdict == AdjudicationVerdict.APPROVE
+        await orch.run(bug)
+        applied = git_ops.apply_fix.call_args.args[1]
+        assert applied is good_fix
 
     @pytest.mark.asyncio
     async def test_repro_test_file_deleted_after_fixed(
@@ -421,138 +385,6 @@ class TestE5LowConfidence:
 
 
 # ---------------------------------------------------------------------------
-# REJECT-all path (E11)
-# ---------------------------------------------------------------------------
-
-class TestRejectAll:
-    @pytest.mark.asyncio
-    async def test_needs_human_when_all_rejected(
-        self, workspace, bug, root_cause, good_fix, regression_test_obj, failing_test_obj, tmp_path
-    ):
-        orch, factory, git_ops, test_runner = _make_orchestrator(
-            workspace, bug,
-            failing_test=failing_test_obj,
-            root_cause=root_cause,
-            fixes=[good_fix],
-            regression_test=regression_test_obj,
-            watsonx_verdict=AdjudicationVerdict.REJECT,
-            tmp_path=tmp_path,
-        )
-        report = await orch.run(bug)
-        assert report.status == ReportStatus.NEEDS_HUMAN
-
-    @pytest.mark.asyncio
-    async def test_no_apply_when_all_rejected(
-        self, workspace, bug, root_cause, good_fix, regression_test_obj, failing_test_obj, tmp_path
-    ):
-        orch, factory, git_ops, test_runner = _make_orchestrator(
-            workspace, bug,
-            failing_test=failing_test_obj,
-            root_cause=root_cause,
-            fixes=[good_fix],
-            regression_test=regression_test_obj,
-            watsonx_verdict=AdjudicationVerdict.REJECT,
-            tmp_path=tmp_path,
-        )
-        await orch.run(bug)
-        git_ops.apply_fix.assert_not_called()
-
-    @pytest.mark.asyncio
-    async def test_last_rejection_reasoning_in_failure_reason(
-        self, workspace, bug, root_cause, good_fix, regression_test_obj, failing_test_obj, tmp_path
-    ):
-        orch, factory, git_ops, test_runner = _make_orchestrator(
-            workspace, bug,
-            failing_test=failing_test_obj,
-            root_cause=root_cause,
-            fixes=[good_fix],
-            regression_test=regression_test_obj,
-            watsonx_verdict=AdjudicationVerdict.REJECT,
-            tmp_path=tmp_path,
-        )
-        report = await orch.run(bug)
-        # At least one attempt must record a failure_reason from the rejection
-        reasons = [a.failure_reason for a in report.attempts if a.failure_reason]
-        assert any("Dangerous change" in r or "rejected" in (r or "").lower() for r in reasons)
-
-
-# ---------------------------------------------------------------------------
-# Fail-open path (watsonx not configured)
-# ---------------------------------------------------------------------------
-
-class TestFailOpen:
-    @pytest.mark.asyncio
-    async def test_fixed_when_watsonx_not_configured(
-        self, workspace, bug, root_cause, good_fix, regression_test_obj, failing_test_obj, tmp_path
-    ):
-        orch, factory, git_ops, test_runner = _make_orchestrator(
-            workspace, bug,
-            failing_test=failing_test_obj,
-            root_cause=root_cause,
-            fixes=[good_fix],
-            regression_test=regression_test_obj,
-            watsonx_configured=False,  # not configured → fail-open
-            tests_pass=True,
-            tmp_path=tmp_path,
-        )
-        report = await orch.run(bug)
-        assert report.status == ReportStatus.FIXED
-
-    @pytest.mark.asyncio
-    async def test_adjudicator_available_false_when_not_configured(
-        self, workspace, bug, root_cause, good_fix, regression_test_obj, failing_test_obj, tmp_path
-    ):
-        orch, factory, git_ops, test_runner = _make_orchestrator(
-            workspace, bug,
-            failing_test=failing_test_obj,
-            root_cause=root_cause,
-            fixes=[good_fix],
-            regression_test=regression_test_obj,
-            watsonx_configured=False,
-            tests_pass=True,
-            tmp_path=tmp_path,
-        )
-        report = await orch.run(bug)
-        assert report.adjudicator_available is False
-
-    @pytest.mark.asyncio
-    async def test_fixed_when_watsonx_raises(
-        self, workspace, bug, root_cause, good_fix, regression_test_obj, failing_test_obj, tmp_path
-    ):
-        orch, factory, git_ops, test_runner = _make_orchestrator(
-            workspace, bug,
-            failing_test=failing_test_obj,
-            root_cause=root_cause,
-            fixes=[good_fix],
-            regression_test=regression_test_obj,
-            watsonx_configured=True,
-            watsonx_raises=True,
-            tests_pass=True,
-            tmp_path=tmp_path,
-        )
-        report = await orch.run(bug)
-        assert report.status == ReportStatus.FIXED
-
-    @pytest.mark.asyncio
-    async def test_adjudicator_available_false_on_watsonx_error(
-        self, workspace, bug, root_cause, good_fix, regression_test_obj, failing_test_obj, tmp_path
-    ):
-        orch, factory, git_ops, test_runner = _make_orchestrator(
-            workspace, bug,
-            failing_test=failing_test_obj,
-            root_cause=root_cause,
-            fixes=[good_fix],
-            regression_test=regression_test_obj,
-            watsonx_configured=True,
-            watsonx_raises=True,
-            tests_pass=True,
-            tmp_path=tmp_path,
-        )
-        report = await orch.run(bug)
-        assert report.adjudicator_available is False
-
-
-# ---------------------------------------------------------------------------
 # Dry-run
 # ---------------------------------------------------------------------------
 
@@ -588,24 +420,6 @@ class TestDryRun:
         )
         await orch.run(bug)
         git_ops.commit.assert_not_called()
-
-    @pytest.mark.asyncio
-    async def test_dry_run_adjudication_still_runs(
-        self, workspace, bug, root_cause, good_fix, regression_test_obj, failing_test_obj, tmp_path
-    ):
-        orch, factory, git_ops, test_runner = _make_orchestrator(
-            workspace, bug,
-            failing_test=failing_test_obj,
-            root_cause=root_cause,
-            fixes=[good_fix],
-            regression_test=regression_test_obj,
-            dry_run=True,
-            watsonx_configured=True,
-            tmp_path=tmp_path,
-        )
-        report = await orch.run(bug)
-        # Adjudication must still have run even with dry-run
-        assert len(report.adjudications) >= 1
 
     @pytest.mark.asyncio
     async def test_dry_run_returns_partial(
@@ -741,7 +555,6 @@ class TestReportBuilder:
         assert report.bug is bug
         assert report.elapsed_seconds >= 0
         assert report.bobcoins_used == 0.0
-        assert report.adjudicator_available is True
 
     def test_accumulates_attempts(self, bug):
         from culprit.application.report_builder import ReportBuilder
@@ -758,13 +571,6 @@ class TestReportBuilder:
         rb.set_bobcoins_used(3.14)
         report = rb.build(ReportStatus.FIXED)
         assert report.bobcoins_used == pytest.approx(3.14)
-
-    def test_adjudicator_available_false(self, bug):
-        from culprit.application.report_builder import ReportBuilder
-        rb = ReportBuilder(bug)
-        rb.set_adjudicator_available(False)
-        report = rb.build(ReportStatus.FIXED)
-        assert report.adjudicator_available is False
 
 
 # ---------------------------------------------------------------------------

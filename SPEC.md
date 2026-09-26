@@ -115,8 +115,7 @@ Defined in src/culprit/config.py:
         attempts: list[Attempt]
         elapsed_seconds: float
         bobcoins_used: float
-        adjudications: list[Adjudication]   # see §12
-        adjudicator_available: bool         # False if watsonx.ai was unreachable
+        commit_sha: Optional[str]           # set when status = FIXED
 
 ## 5. Subagents (Strategy pattern; each has a specific output type)
 
@@ -155,10 +154,7 @@ Defined in src/culprit/config.py:
         if confidence < CONFIDENCE_FLOOR:
             return NEEDS_HUMAN
         candidates = FixAuthor(root_cause)       # up to 3, lowest risk first
-        fix = first candidate whose adjudication == APPROVE   # §12; fail-open
-        if no candidate approved:
-            record failure  # reasoning feeds next attempt as context
-            continue        # no fix is EVER applied without approval
+        fix = candidates[0]                      # lowest risk; §12
         regression_test = Guard(root_cause, fix)
         apply(fix + regression_test)
         result = test_runner.run(all_codebases)
@@ -204,7 +200,7 @@ Defined in src/culprit/config.py:
     - Test execution and result parsing
     - Git operations (commit, diff, revert)
     - Pydantic schema validation
-    - Adjudication total score and APPROVE/REJECT verdict (threshold compare)
+    - Which fix is kept: the full test suite decides (§12)
 
 ## 10. Secrets policy (hard rule)
 
@@ -234,72 +230,34 @@ Defined in src/culprit/config.py:
         --folder ./sample_app/shared \
         --issue "cart total wrong when discount code applied"
 
-## 12. watsonx.ai Adjudicator (second opinion)
+## 12. Fix selection: the test suite is the judge
 
-    Model:    read from WATSONX_MODEL_ID (a Granite model listed in the
-              hackathon "watsonx Hackathon Sandbox" project, Dallas region).
-              Never llama-3-405b-instruct or mistral-* (out of scope per
-              hackathon guide).
-    Transport: plain REST via httpx (IAM token endpoint + watsonx.ai
-              text/chat endpoint). No ibm-watsonx-ai SDK: keeps deps light
-              and avoids Python-version compatibility risk.
-    Endpoint: WATSONX_URL (default https://us-south.ml.cloud.ibm.com)
-    Project:  WATSONX_PROJECT_ID
-    Auth:     IBM_CLOUD_API_KEY from .env -> IAM token -> watsonx bearer
-              (secrets policy of §10 applies: never logged, never in the
-              report, never in Bob chat context)
+    FixAuthor returns up to 3 candidates ranked lowest risk first
+    (quick patch < proper fix < refactor). Culprit applies candidate 0.
+    Whether it stays is decided deterministically, never by a model:
 
-    Role: independent critic. Reads (root_cause, the fix selected for this
-    attempt, relevant source context) and scores it on three axes:
-      - correctness  (does the fix actually address the root cause?)
-      - safety       (does the fix introduce new risks?)
-      - minimalism   (is it the smallest change that works?)
+      * the Reproducer's test must FAIL before the fix (E9), and
+      * the WHOLE test suite, including the new regression test, must PASS
+        after it. Otherwise the fix is reverted and the failing tests feed
+        the next attempt (max MAX_ATTEMPTS).
 
-    class Adjudication:
-        correctness_score: float   # 0.0 - 1.0   (from the model)
-        safety_score: float        # 0.0 - 1.0   (from the model)
-        minimalism_score: float    # 0.0 - 1.0   (from the model)
-        total_score: float         # mean of the 3 axes (computed by code)
-        verdict: APPROVE | REJECT  # total_score >= threshold (computed by code)
-        reasoning: str             # from the model
+    Design note: an optional watsonx.ai "adjudicator" (a second model
+    scoring each fix) was designed and then removed, because no IBM Cloud
+    account was available during the hackathon. Tests are an objective
+    judge that needs no second model.
 
-    The model only produces the three axis scores and the reasoning.
-    total_score and verdict are computed deterministically by code.
-    Model output is schema-enforced via the Adjudication pydantic model.
+## 13. Where each part adds value (defensible answer)
 
-    Hard constants (defined in src/culprit/config.py):
+    IBM Bob subagents: repository-aware, multi-file semantic reasoning:
+      mapping a live HTTP response to source lines across codebases,
+      writing tests, and proposing exact edits.
 
-        ADJUDICATION_THRESHOLD = 0.65    # total_score below this -> REJECT
-        WATSONX_TIMEOUT_SECONDS = 20
-        WATSONX_MAX_RETRIES = 2
+    watsonx Orchestrate agent (§16): the chat front door; lets anyone on
+      the team trigger a Culprit run and read the result without a
+      terminal.
 
-    Behavior:
-      * REJECT -> the fix is NOT applied; the reasoning is recorded as the
-        attempt's failure_reason and fed to the next attempt (§6).
-      * watsonx failure, timeout, or missing credentials -> log a warning
-        and proceed WITHOUT adjudication; report.adjudicator_available =
-        false. Never block on infrastructure failure.
-      * Malformed model output -> pydantic error -> one retry -> then
-        treated as a watsonx failure (previous bullet).
-      * Source context sent to watsonx passes through the same redaction
-        as bob_client (§10).
-      * --dry-run -> adjudication still runs and is reported; nothing is
-        applied and nothing is committed (E6).
-
-    New edge case:
-      E11  Every attempt REJECTed -> NEEDS_HUMAN, with the last
-           adjudication reasoning included in the report.
-
-## 13. Where each model adds value (defensible answer)
-
-    Bob subagents: repository-aware, multi-file semantic reasoning; Agent
-      mode for tool use (git, tests, filesystem).
-
-    watsonx.ai Granite: an independent second opinion on proposed fixes,
-      reducing single-model blind spots; produces structured axis scores.
-
-    Deterministic code: budget, HTTP, git, schema validation, loops,
-      adjudication total and verdict.
+    Deterministic code: budget, HTTP, auth, applying edits, running tests,
+      git, schema validation, loop control, and the keep-or-revert decision.
 
 ## 14. Bob runtime integration (how Culprit calls Bob)
 
@@ -324,8 +282,8 @@ Defined in src/culprit/config.py:
 
     MUST (demo path):
       --folder (1-6), --url (1), --auth-bearer, --no-auth, --issue,
-      --dry-run; 4 subagents via Bob Shell; watsonx.ai adjudicator
-      (fail-open); apply -> pytest -> commit; Rich terminal report.
+      --dry-run; 4 subagents via Bob Shell; apply -> pytest -> commit;
+      Rich terminal report; culprit serve + watsonx Orchestrate agent (§16).
 
     STRETCH (only if time remains; keep stubs raising NotImplementedError):
       --git, --auth-basic, --auth-oauth2, --auth-apikey, --trace.

@@ -32,9 +32,6 @@ structlog>=24.1
 pytest-mock>=3.12
 pytest-asyncio>=0.23
 
-# watsonx.ai Adjudicator (SPEC section 12): plain REST via httpx (above),
-# no ibm-watsonx-ai SDK needed
-
 # HTTP API for watsonx Orchestrate (culprit serve)
 fastapi>=0.110
 uvicorn>=0.29
