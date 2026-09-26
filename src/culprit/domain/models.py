@@ -209,3 +209,4 @@ class CulpritReport(BaseModel):
     bobcoins_used: float
     adjudications: list[Adjudication]
     adjudicator_available: bool
+    commit_sha: Optional[str] = None  # set when status is FIXED

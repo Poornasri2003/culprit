@@ -126,14 +126,14 @@ class Orchestrator:
 
             if final_status is not None:
                 report = self._report_builder.build(final_status)
-                object.__setattr__(report, "_commit_sha", commit_sha)
+                report.commit_sha = commit_sha
                 return report
 
             prior_failure = attempt.failure_reason
 
         # All attempts exhausted without a fixed outcome
         report = self._report_builder.build(ReportStatus.NEEDS_HUMAN)
-        object.__setattr__(report, "_commit_sha", None)
+        report.commit_sha = None
         return report
 
     # -----------------------------------------------------------------------

@@ -47,6 +47,16 @@ def cli() -> None:
     """Culprit — AI-powered backend debugger."""
 
 
+@cli.command("serve")
+@click.option("--host", default="127.0.0.1", show_default=True, help="Interface to bind.")
+@click.option("--port", default=8080, show_default=True, type=int, help="Port to listen on.")
+def serve_command(host: str, port: int) -> None:
+    """Start the Culprit HTTP API (used by the watsonx Orchestrate agent)."""
+    import uvicorn
+
+    uvicorn.run("culprit.server:app", host=host, port=port, log_level="info")
+
+
 @cli.command("debug")
 @click.argument("inputs", nargs=-1)
 @click.option("--issue", required=True, help="Bug description.")
@@ -97,6 +107,12 @@ def cli() -> None:
     help="Explicit for public endpoints.",
 )
 @click.option(
+    "--json-report",
+    type=click.Path(dir_okay=False),
+    default=None,
+    help="Also write the final report as JSON to this file (used by `culprit serve`).",
+)
+@click.option(
     "--dry-run",
     is_flag=True,
     default=False,
@@ -112,6 +128,7 @@ def debug_command(
     git_urls: tuple[str, ...],
     trace: Optional[str],
     auth_scheme: Optional[str],
+    json_report: Optional[str],
     dry_run: bool,
 ) -> None:
     """
@@ -214,6 +231,8 @@ def debug_command(
 
     # ── Render final report ───────────────────────────────────────────────
     _render_report(report, run_start)
+    if json_report:
+        Path(json_report).write_text(report.model_dump_json(indent=2), encoding="utf-8")
 
     exit_code = 0 if report.status == ReportStatus.FIXED else 1
     sys.exit(exit_code)
@@ -289,7 +308,7 @@ def _render_report(report: CulpritReport, run_start: float) -> None:
             console.print(f"  Tests:        [{tr_color}]{'PASSED' if tr.passed else 'FAILED'}[/{tr_color}]")
 
     # Commit SHA
-    commit_sha = getattr(report, "_commit_sha", None)
+    commit_sha = report.commit_sha
     if commit_sha:
         console.print(f"  Commit SHA:   {commit_sha}")
 

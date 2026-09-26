@@ -90,6 +90,37 @@ In terminal 2, run the `culprit debug …` command shown at the top of this READ
 
 Set `IBM_CLOUD_API_KEY`, `WATSONX_PROJECT_ID`, `WATSONX_URL` and `WATSONX_MODEL_ID` in `.env`. Without these values, Culprit prints "watsonx not configured" and continues, so the adjudicator never blocks a run.
 
+## Trigger it from chat with watsonx Orchestrate
+
+An on-call engineer doesn't need a terminal. A **watsonx Orchestrate** agent, `culprit_oncall`, runs Culprit from chat:
+
+> 👤 *"Customers say the cart total is wrong when they use the SAVE10 discount code."*
+> 🤖 *"Culprit started (job 77852e…). … FIXED in 73 s for 0.18 Bobcoins. Root cause: shared/pricing.py line 28. All tests pass, and the fix and regression test are committed (3e6c3f1)."*
+
+```
+Orchestrate chat ─► agent culprit_oncall ─► tools start_culprit_debug / get_culprit_debug_result
+                                                  │ (OpenAPI tools + bearer connection)
+                                                  ▼
+                            Cloudflare tunnel ─► culprit serve (FastAPI) ─► culprit debug ─► Bob Shell
+```
+
+- The API is **asynchronous**, because a run (about 60 s) exceeds Orchestrate's 40 s limit for synchronous tools. One call starts the run, and a second fetches the result.
+- It is **bearer-token protected**. Callers choose **only the issue text**: the project, the URL and the folders are fixed on the server side.
+- The Orchestrate developer kit (ADK) lives in its own `.venv-orchestrate/`, apart from Culprit's own dependencies.
+
+Setup, using the free 30-day watsonx Orchestrate trial:
+
+```bash
+python -m venv .venv-orchestrate && .venv-orchestrate/Scripts/pip install ibm-watsonx-orchestrate
+# .env: WO_INSTANCE_URL and WO_API_KEY (Orchestrate > Settings > API details)
+python scripts/prepare_demo.py && python scripts/run_backend.py      # terminal 1
+python -m culprit serve --port 8080                                   # terminal 2
+cloudflared tunnel --url http://localhost:8080                        # terminal 3, copy the https URL
+python scripts/orchestrate_deploy.py --tunnel-url https://<name>.trycloudflare.com
+```
+
+Then open Orchestrate **Chat**, pick **culprit_oncall**, and report the bug.
+
 ## The demo scenario
 
 `sample_app/` is a small multi-service shop:
@@ -108,13 +139,15 @@ The documented business rule says a fixed discount code (for example `SAVE10`) c
 ```
 src/culprit/
   cli.py                      Click CLI with the Rich live progress and report
+  server.py                   HTTP API for watsonx Orchestrate (culprit serve)
   application/                orchestrator.py (the loop), report_builder.py
   domain/                     Pydantic models and exceptions
   subagents/                  Reproducer, CauseTracer, FixAuthor, Guard (Strategy) and their factory
   infrastructure/             bob_client, watsonx_client, http_client, auth, workspace, test_runner, git_ops
-tests/                        150 unit tests, with no network, no Bob and no cost
+tests/                        162 unit tests, with no network, no Bob and no cost
 sample_app/                   the demo app with its seeded bug
-scripts/                      prepare_demo.py, run_backend.py
+scripts/                      prepare_demo.py, run_backend.py, orchestrate_deploy.py
+orchestrate/                  Orchestrate agent and OpenAPI tool definitions
 SPEC.md, ARCHITECTURE.md      the specification and design Culprit was built from
 bob_sessions/                 exported IBM Bob task sessions and screenshots (hackathon requirement)
 ```

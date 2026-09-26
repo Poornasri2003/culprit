@@ -329,3 +329,21 @@ Defined in src/culprit/config.py:
 
     STRETCH (only if time remains; keep stubs raising NotImplementedError):
       --git, --auth-basic, --auth-oauth2, --auth-apikey, --trace.
+
+## 16. watsonx Orchestrate integration (chat-triggered runs)
+
+    culprit serve  -> FastAPI app (src/culprit/server.py), bearer-token protected
+      POST /debug          {issue} -> 202 {job_id}   (Orchestrate tool: start_culprit_debug)
+      GET  /debug/{job_id} -> status + report summary (tool: get_culprit_debug_result)
+      GET  /health
+
+    Asynchronous because a run (~60 s) exceeds Orchestrate's 40 s limit for
+    synchronous tools. One run at a time (409 otherwise).
+    Callers choose ONLY the issue text; the project (demo_workspace/sample_app),
+    live URL and folders are fixed server-side. Each run resets the demo and
+    runs `culprit debug --json-report` as a subprocess (argv list, no shell).
+
+    Orchestrate side (orchestrate/, deployed by scripts/orchestrate_deploy.py):
+      - bearer connection "culprit_api" holding CULPRIT_API_TOKEN
+      - OpenAPI 3.0 tools pointing at a Cloudflare quick tunnel to culprit serve
+      - native agent "culprit_oncall" that starts a run and reports the result

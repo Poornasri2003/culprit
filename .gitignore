@@ -123,3 +123,6 @@ build/
 
 # Culprit demo runs (own git repo, recreated by scripts/prepare_demo.py)
 demo_workspace/
+
+# watsonx Orchestrate ADK (isolated from Culprit deps)
+.venv-orchestrate/

@@ -1,0 +1,90 @@
+openapi: 3.0.3
+info:
+  title: Culprit API
+  version: 1.0.0
+  description: >
+    Culprit is an IBM Bob-powered debugger. It probes the live demo shop
+    service, reproduces a reported bug as a failing test, traces the root
+    cause across codebases, and commits a tested fix.
+servers:
+  # Replaced with the public tunnel URL by scripts/orchestrate_deploy.py
+  - url: https://REPLACE_WITH_TUNNEL_URL
+security:
+  - bearerAuth: []
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+  schemas:
+    DebugRequest:
+      type: object
+      required: [issue]
+      properties:
+        issue:
+          type: string
+          description: The bug report in one sentence, e.g. "cart total wrong when discount code applied".
+    DebugStarted:
+      type: object
+      properties:
+        job_id: {type: string, description: Id to pass to get_culprit_debug_result.}
+        status: {type: string}
+        message: {type: string}
+    DebugResult:
+      type: object
+      properties:
+        job_id: {type: string}
+        status: {type: string, description: "running, done or error"}
+        elapsed_seconds: {type: number}
+        progress: {type: array, items: {type: string}, description: Live step log.}
+        culprit_status: {type: string, description: "FIXED, PARTIAL or NEEDS_HUMAN"}
+        root_cause: {type: string}
+        fix_diff: {type: string}
+        tests_passed: {type: boolean}
+        commit_sha: {type: string}
+        bobcoins_used: {type: number}
+        adjudicator_available: {type: boolean}
+        summary: {type: string, description: One-paragraph human-readable result.}
+paths:
+  /debug:
+    post:
+      operationId: start_culprit_debug
+      summary: Start a Culprit debugging run
+      description: >
+        Starts Culprit on the demo shop project for the given bug report and
+        returns a job_id immediately. A run takes about 60 seconds; call
+        get_culprit_debug_result with the job_id to get the outcome.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/DebugRequest'}
+      responses:
+        '202':
+          description: Run started.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/DebugStarted'}
+        '409':
+          description: Another run is already in progress.
+  /debug/{job_id}:
+    get:
+      operationId: get_culprit_debug_result
+      summary: Get the result of a Culprit run
+      description: >
+        Returns the status of a Culprit run. While status is "running",
+        report the progress lines and check again later. When status is
+        "done", report culprit_status, root_cause, tests_passed, commit_sha,
+        bobcoins_used and the summary.
+      parameters:
+        - name: job_id
+          in: path
+          required: true
+          schema: {type: string}
+          description: The job_id returned by start_culprit_debug.
+      responses:
+        '200':
+          description: Current status or final result.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/DebugResult'}
