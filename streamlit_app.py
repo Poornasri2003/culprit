@@ -378,6 +378,18 @@ with tab_onboard:
                 key="git_url",
             )
         elif src_kind == "Local folder":
+            # The text_input owns the "local_path" widget key. To let the Browse
+            # button also write to it, we mutate session_state inside an
+            # on_click callback that fires BEFORE the widget re-instantiates on
+            # the next rerun (writing to a widget-owned key after instantiation
+            # raises StreamlitWidgetAlreadyInstantiatedError).
+            st.session_state.setdefault("local_path", "")
+
+            def _pick_local_folder() -> None:
+                chosen = _folder_picker_dialog()
+                if chosen:
+                    st.session_state.local_path = chosen
+
             col_path, col_browse = st.columns([5, 1])
             with col_path:
                 repo_spec = st.text_input(
@@ -385,20 +397,16 @@ with tab_onboard:
                     placeholder=r"D:\work\my-service",
                     disabled=running,
                     key="local_path",
-                    value=st.session_state.get("local_path", ""),
                 )
             with col_browse:
                 st.write("")  # vertical spacer aligns with the input
-                if st.button("📁 Browse…", disabled=running, use_container_width=True,
-                             help="Open a native folder picker on this machine."):
-                    chosen = _folder_picker_dialog()
-                    if chosen:
-                        st.session_state.local_path = chosen
-                        st.rerun()
-                    else:
-                        st.toast("No folder chosen.", icon="ℹ️")
-            if not repo_spec and st.session_state.get("local_path"):
-                repo_spec = st.session_state["local_path"]
+                st.button(
+                    "📁 Browse…",
+                    disabled=running,
+                    use_container_width=True,
+                    help="Open a native folder picker on this machine.",
+                    on_click=_pick_local_folder,
+                )
         else:
             uploaded = st.file_uploader(
                 "Upload a .zip of the repository",
