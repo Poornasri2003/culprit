@@ -896,10 +896,10 @@ class GitOps:
     """
 
     def apply_fix(self, codebase: SourceCodebase, fix: Fix) -> None:
-        """Apply a unified diff to the codebase working tree (does not commit)."""
+        """Back up each target file, then apply fix.edits (each old_text must match exactly once); does not commit."""
 
     def revert_fix(self, codebase: SourceCodebase, fix: Fix) -> None:
-        """Undo all changes introduced by the given fix."""
+        """Restore the backed-up originals of every file touched by apply_fix."""
 
     def commit(
         self,
