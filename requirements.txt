@@ -1,0 +1,37 @@
+# Culprit dependencies
+
+# Data & validation (spec-critical)
+pydantic>=2.5,<3.0
+pydantic-settings>=2.1
+
+# CLI
+click>=8.1
+
+# HTTP + auth (runtime probing)
+httpx[http2]>=0.27
+requests-oauthlib>=1.3
+python-dotenv>=1.0
+
+# Git
+GitPython>=3.1
+
+# Test runner (subprocess wrapper around pytest)
+pytest>=7.4
+pytest-timeout>=2.2
+
+# Concurrency (parallel subagents)
+anyio>=4.2
+
+# Pretty terminal output (for demo video visual polish)
+rich>=13.7
+
+# Structured logging
+structlog>=24.1
+
+# Development / testing Culprit itself
+pytest-mock>=3.12
+pytest-asyncio>=0.23
+
+# watsonx.ai Adjudicator (SPEC section 12)
+ibm-watsonx-ai>=1.1.0
+ibm-cloud-sdk-core>=3.20.0
