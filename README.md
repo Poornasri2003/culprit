@@ -39,21 +39,55 @@ Most AI debuggers only read code. Many real bugs, though, are only visible at ru
 ## How it works
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│  culprit debug  --url --method --body --auth-bearer --folder… │  CLI (Click + Rich)
-├─────────────────────────────────────────────────────────────────┤
-│  Orchestrator: self-healing loop, max 3 attempts, 240 s budget  │
-│                                                                 │
-│   probe URL ─► Reproducer ‖ CauseTracer ─► FixAuthor            │  IBM Bob (Bob Shell)
-│                    │                          │                 │
-│         repro test must FAIL        watsonx.ai Granite reviews  │  optional second opinion
-│         on current code (E9)        each candidate (fail-open)  │
-│                                               │                 │
-│               Guard writes regression test ◄──┘                 │
-│                    │                                            │
-│          apply fix ─► run all tests ─► commit   or   revert     │  deterministic code
-└─────────────────────────────────────────────────────────────────┘
+ ENTRY POINTS
+ ┌──────────────────────────────────────────┐      ┌──────────────────────────────┐
+ │ watsonx Orchestrate chat                 │      │ Terminal                     │
+ │  AGENT: culprit_oncall                   │      │  $ culprit debug --url ...   │
+ │   TOOL start_culprit_debug(issue)        │      │    (Click + Rich live view)  │
+ │   TOOL get_culprit_debug_result(job_id)  │      └──────────────┬───────────────┘
+ └──────────────────┬───────────────────────┘                     │
+                    │ HTTPS + bearer token (Cloudflare tunnel)    │
+                    ▼                                             │
+ ┌──────────────────────────────────────────┐                     │
+ │ culprit serve  (FastAPI, async jobs)     │                     │
+ └──────────────────┬───────────────────────┘                     │
+                    ▼                                             ▼
+ CULPRIT ORCHESTRATOR (plain Python: loop of max 3 attempts, 240 s, Bobcoin cap)
+ ┌────────────────────────────────────────────────────────────────────────────┐
+ │ 1. TOOL HttpClient.probe ──► live evidence: HTTP 200 {"total": 32.4}       │
+ │                                                                            │
+ │ 2. SUBAGENT Reproducer  ‖  SUBAGENT CauseTracer        (in parallel)       │
+ │      failing pytest          root cause + confidence                       │
+ │                                                                            │
+ │ 3. TOOL TestRunner: the repro test must FAIL on the current code           │
+ │                                                                            │
+ │ 4. SUBAGENT FixAuthor ──► up to 3 fixes (exact search/replace edits)       │
+ │                                                                            │
+ │ 5. ADJUDICATOR watsonx.ai Granite scores each fix  (optional, fail-open)   │
+ │                                                                            │
+ │ 6. SUBAGENT Guard ──► permanent regression test                            │
+ │                                                                            │
+ │ 7. TOOL GitOps.apply ─► TOOL TestRunner (all tests) ─► TOOL GitOps.commit  │
+ │                                  └── tests fail? GitOps.revert, retry      │
+ └────────────────────────────────────────────────────────────────────────────┘
+          │ each SUBAGENT = one headless IBM Bob run
+          ▼
+ IBM BOB SHELL:  bob run --format json --mode ask --max-cost <budget> -w <project>
+   Bob's own read-only TOOLS: list files, read files, search code
+   (ask mode: Bob can read the code but never write it; Culprit applies the edits)
 ```
+
+### Agent, subagent, tool: what each word means here
+
+| Term | In Culprit | Who runs it |
+|---|---|---|
+| **Agent** | `culprit_oncall`, a chat assistant in watsonx Orchestrate. It understands the user's bug report and decides which tool to call | watsonx Orchestrate (an LLM) |
+| **Tool** (Orchestrate) | `start_culprit_debug` and `get_culprit_debug_result`, the two actions the agent can take. They're defined in `orchestrate/culprit_openapi.yaml` and call `culprit serve` | Culprit's HTTP API |
+| **Orchestrator** | The boss inside Culprit. Plain Python that runs the steps in order, enforces limits, and decides to commit or revert. It contains no AI | Python |
+| **Subagent** | One specialist job given to Bob: **Reproducer**, **CauseTracer**, **FixAuthor** or **Guard**. Each gets its own prompt and returns strict JSON | IBM Bob, through Bob Shell |
+| **Tool** (Culprit) | Plain-code actions the orchestrator uses: `HttpClient` (probe the live URL), `TestRunner` (pytest), `GitOps` (apply, revert, commit) | Python |
+| **Tool** (Bob) | Bob's built-in abilities during a subagent run: list, read and search files. They're read-only in ask mode | IBM Bob |
+| **Adjudicator** | A second AI opinion that scores each fix. The final verdict is computed by code | watsonx.ai Granite |
 
 | Part | What decides | Why |
 |---|---|---|
