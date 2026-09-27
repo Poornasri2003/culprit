@@ -28,6 +28,34 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+
+def _load_streamlit_secrets_into_env() -> None:
+    """Copy Streamlit Cloud's Secrets manager values into os.environ.
+
+    Streamlit Cloud has no `.env` file — secrets are pasted into a "Secrets"
+    text box in the app's settings and surface as `st.secrets`, not
+    environment variables. Compass's config layer reads `os.environ`
+    everywhere, so we bridge the two here, once, at import time. Local `.env`
+    values (already loaded above) take precedence — this only fills in what's
+    still missing.
+    """
+    try:
+        secrets = st.secrets
+    except Exception:
+        return
+    for key in ("BOB_API_KEY", "MONGO_URI", "MONGO_DB", "GOOGLE_CLIENT_ID",
+                "GOOGLE_CLIENT_SECRET", "GOOGLE_REDIRECT_URI", "COMPASS_API_TOKEN",
+                "COMPASS_BOOTSTRAP_DIR"):
+        try:
+            value = secrets.get(key)
+        except Exception:
+            value = None
+        if value and not os.environ.get(key):
+            os.environ[key] = str(value)
+
+
+_load_streamlit_secrets_into_env()
+
 # ---------------------------------------------------------------------------
 # Page + styling
 # ---------------------------------------------------------------------------
@@ -241,15 +269,21 @@ with st.sidebar:
     st.divider()
 
     st.markdown("**Bob API key**")
+    # Never pre-fill this box with a value that came from Streamlit secrets —
+    # a shared deployment-wide key would otherwise be revealable to any signed-in
+    # user via the input's built-in show/hide eye icon. It stays empty unless
+    # *this* user types their own key, which then overrides the deployment's.
     bob_key = st.text_input(
-        "BOB_API_KEY", value=os.getenv("BOB_API_KEY", ""),
+        "BOB_API_KEY", value="",
         type="password", label_visibility="collapsed",
-        help="Get one at https://bob.ibm.com → API keys.",
+        help="Get one at https://bob.ibm.com → API keys. Leave blank to use the deployment's key, if one is configured.",
         disabled=st.session_state.running,
     )
     if bob_key:
         os.environ["BOB_API_KEY"] = bob_key
-        st.success("Bob key loaded.", icon="✅")
+        st.success("Using the key you pasted.", icon="✅")
+    elif os.environ.get("BOB_API_KEY"):
+        st.success("Using the deployment's configured Bob key.", icon="✅")
     else:
         st.info("Paste your Bob key to enable real runs.", icon="🔑")
 
@@ -265,17 +299,24 @@ with st.sidebar:
 
     # --- Health ---
     import shutil as _shutil
+    from compass.infrastructure.bob_bootstrap import is_bootstrapped
     st.divider()
+    bob_ready = _shutil.which("bob") is not None or is_bootstrapped()
     checks = {
-        "Bob CLI":       _shutil.which("bob") is not None,
+        "Bob runtime":   bob_ready,
         "Git":           _shutil.which("git") is not None,
-        "Node":          _shutil.which("node") is not None,
         "BOB_API_KEY":   bool(os.environ.get("BOB_API_KEY")),
         "Real MongoDB":  is_real_mongo(),
     }
     st.markdown("**Environment**")
     for label, ok in checks.items():
         st.markdown(f"- {'✅' if ok else '⚠️'} {label}")
+    if not bob_ready:
+        st.caption(
+            "Bob CLI not found on this host, and it can't be auto-installed here — "
+            "`bobshell` isn't on the public npm registry. Real runs need Bob "
+            "installed via IBM's official installer on the machine running Compass."
+        )
     st.caption("MIT-licensed · IBM Bob 2.0 · lablab.ai")
 
 # ---------------------------------------------------------------------------

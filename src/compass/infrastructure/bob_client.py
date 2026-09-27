@@ -33,9 +33,15 @@ from compass.domain.exceptions import BobBudgetExhausted, BobShellError, SchemaE
 def _bob_argv() -> list[str]:
     """Return the base argv for invoking Bob Shell (before `run` and its flags).
 
-    * Honours COMPASS_BOB_ENTRY when set (points at bob.js and uses node).
-    * On Windows, defaults to `%APPDATA%\\npm\\node_modules\\bobshell\\dist\\bob.js` via node.
-    * Elsewhere, uses `bob` on PATH.
+    Resolution order:
+      1. COMPASS_BOB_ENTRY env var — explicit override (points at bob.js, run via node).
+      2. A `bob` binary already on PATH — covers a normal global npm install on
+         Linux/macOS, or a system administrator having installed it directly.
+      3. The Windows npm-global layout Bob's own installer writes by default.
+      4. The self-contained bootstrap (compass.infrastructure.bob_bootstrap) —
+         downloads Node + bobshell into a local cache with no sudo/apt/admin
+         required. This is what makes Compass runnable on Streamlit Community
+         Cloud, Hugging Face Spaces, or any fresh VPS with zero manual setup.
     """
     override = os.environ.get("COMPASS_BOB_ENTRY")
     if override:
@@ -44,25 +50,20 @@ def _bob_argv() -> list[str]:
             raise BobShellError("`node` not found on PATH; required to run bob.js")
         return [node, override]
 
+    bob = shutil.which("bob")
+    if bob is not None:
+        return [bob]
+
     if sys.platform == "win32":
         node = shutil.which("node")
-        if node is None:
-            raise BobShellError("`node` not found on PATH; required to run Bob Shell on Windows")
         appdata = os.environ.get("APPDATA", "")
         bob_js = Path(appdata) / "npm" / "node_modules" / "bobshell" / "dist" / "bob.js"
-        if not bob_js.exists():
-            raise BobShellError(
-                f"Bob Shell entry not found at {bob_js}. "
-                f"Install with `npm install -g bobshell`, or set COMPASS_BOB_ENTRY."
-            )
-        return [node, str(bob_js)]
+        if node is not None and bob_js.exists():
+            return [node, str(bob_js)]
 
-    bob = shutil.which("bob")
-    if bob is None:
-        raise BobShellError(
-            "`bob` not found on PATH. Install Bob Shell locally, or set COMPASS_BOB_ENTRY."
-        )
-    return [bob]
+    from compass.infrastructure.bob_bootstrap import ensure_bob_runtime
+    node_bin, bob_js_path = ensure_bob_runtime()
+    return [node_bin, bob_js_path]
 
 
 def _extract_json(text: str) -> Any:
