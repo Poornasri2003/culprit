@@ -106,6 +106,7 @@ class Orchestrator:
                 subagents=reports,
                 total_wall_clock_seconds=time.perf_counter() - t0,
                 total_tokens=sum(r.tokens_prompt + r.tokens_completion for r in reports),
+                total_bobcoins=sum(r.bobcoins for r in reports),
             )
             write_pack(pack, output_dir)
             self._on_progress(

@@ -44,6 +44,9 @@ class RepoInventory(BaseModel):
     top_dirs: list[str]
     tracked_file_count: NonNegativeInt
     size_estimate_tokens: NonNegativeInt
+    # Optional content classifier — Scout fills this in so downstream code
+    # can adapt when the "repo" is actually docs, media, or mixed content.
+    content_kind: Literal["code", "docs", "media", "mixed", "unknown"] = "unknown"
 
 
 # --- Cartographer ---------------------------------------------------------
@@ -133,6 +136,7 @@ class SubagentReport(BaseModel):
     duration_seconds: NonNegativeFloat
     tokens_prompt: NonNegativeInt
     tokens_completion: NonNegativeInt
+    bobcoins: NonNegativeFloat = 0.0
     retries: NonNegativeInt
     ok: bool
     error: str | None = None
@@ -148,6 +152,7 @@ class OnboardingPack(BaseModel):
     subagents: list[SubagentReport]
     total_wall_clock_seconds: NonNegativeFloat
     total_tokens: NonNegativeInt
+    total_bobcoins: NonNegativeFloat = 0.0
 
 
 # --- /ask protocol --------------------------------------------------------

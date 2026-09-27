@@ -26,11 +26,18 @@ dependencies = [
     "python-dotenv>=1.0",
     "rich>=13.7",
     "pathspec>=0.12",
+    "pymongo>=4.7",
+    "mongomock>=4.1",
+    "bcrypt>=4.1",
 ]
 
 [project.optional-dependencies]
 ui = [
     "streamlit>=1.36",
+]
+google = [
+    "streamlit-oauth>=0.1.14",
+    "google-auth>=2.30",
 ]
 dev = [
     "pytest>=8.2",

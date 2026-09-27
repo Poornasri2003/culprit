@@ -1,8 +1,8 @@
-"""Compass — Streamlit UI.
+"""Compass — Streamlit UI with auth, cost tracking, and run history.
 
-Point Compass at any Git repo (GitHub, GitLab, Bitbucket, SSH), a local
-folder, or a .zip upload, and watch four Bob subagents build an onboarding
-pack. Includes a one-click Demo that works without a Bob key.
+Point Compass at any Git repo, local folder, or .zip upload; watch four Bob
+subagents build an onboarding pack; and see the Bobcoins each subagent spent
+tracked per-run in MongoDB.
 
 Run locally:
     streamlit run streamlit_app.py
@@ -17,6 +17,7 @@ import json
 import os
 import tempfile
 import zipfile
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -28,7 +29,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # ---------------------------------------------------------------------------
-# Page config + light custom styling
+# Page + styling
 # ---------------------------------------------------------------------------
 
 st.set_page_config(
@@ -36,100 +37,246 @@ st.set_page_config(
     page_icon="🧭",
     layout="wide",
     initial_sidebar_state="expanded",
-    menu_items={
-        "About": "Compass is an IBM Bob 2.0 agent that turns any Git repo, "
-                 "folder, or .zip into an onboarding pack in minutes.",
-    },
+    menu_items={"About": "Compass — IBM Bob 2.0 developer-onboarding agent."},
 )
 
 st.markdown(
     """
     <style>
-      /* Hero */
-      .compass-hero { padding: 0.15rem 0 0.75rem 0; }
+      .compass-hero  { padding: 0.15rem 0 0.75rem 0; }
       .compass-hero h1 { margin: 0 0 0.15rem 0; font-size: 2.2rem; letter-spacing: -0.5px; }
       .compass-hero p  { color: #6b7280; margin: 0; font-size: 1.02rem; }
       .compass-badge   { display: inline-block; padding: 2px 8px; border-radius: 999px;
                          background: #eef2ff; color: #4f46e5; font-size: 0.75rem;
                          margin: 4px 4px 0 0; border: 1px solid #e0e7ff; }
-      /* Nicer tabs */
       .stTabs [data-baseweb="tab-list"] { gap: 10px; }
       .stTabs [data-baseweb="tab"]      { font-weight: 500; }
-      /* Bordered containers get a bit of breathing room */
-      div[data-testid="stVerticalBlockBorderWrapper"] { padding: 0.5rem 0; }
-      /* Answer / rendered markdown feels roomier */
       .compass-answer { line-height: 1.55; font-size: 1.02rem; }
-      .compass-answer pre, .compass-answer code { font-size: 0.92em; }
-      /* Small "muted" caption look */
       .muted { color: #6b7280; font-size: 0.85rem; }
+      .cost-pill { display: inline-block; padding: 2px 10px; border-radius: 999px;
+                   background: #ecfdf5; color: #065f46; font-weight: 600;
+                   border: 1px solid #a7f3d0; }
     </style>
     """,
     unsafe_allow_html=True,
 )
 
 # ---------------------------------------------------------------------------
-# Session state defaults
+# Session-state defaults
 # ---------------------------------------------------------------------------
 
 _defaults = {
+    "user": None,                 # dict {username, email, provider}
     "running": False,
-    "pack_dir": None,          # str path to the last completed pack
+    "pack_dir": None,             # str path to last pack
     "last_error": None,
-    "queued_run": None,        # dict of run params, set by button click, consumed next rerun
-    "progress_lines": [],      # list[str] rendered under the run form during a run
+    "last_pack_totals": None,     # dict {bobcoins, tokens, wallclock}
+    "last_browse_msg": None,
+    "local_path": "",
+    "output_name": "onboarding_ui",
 }
 for k, v in _defaults.items():
     st.session_state.setdefault(k, v)
 
 # ---------------------------------------------------------------------------
-# Sidebar — Bob key + health only (COMPASS_API_TOKEN is not needed here)
+# Storage & auth
+# ---------------------------------------------------------------------------
+
+from compass.storage import RunsRepo, UsersRepo, get_db
+from compass.storage.mongo import is_real_mongo
+from compass.storage.users import AuthError
+
+_db = get_db()
+_users = UsersRepo(_db)
+_runs = RunsRepo(_db)
+
+
+def _render_auth() -> None:
+    """Login / signup screen. Shown when st.session_state.user is None."""
+    st.markdown(
+        """
+        <div class="compass-hero">
+          <h1>🧭 Compass</h1>
+          <p>Sign in to onboard any repo. Your usage and run history live in your account.</p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    if not is_real_mongo():
+        st.warning(
+            "MongoDB is not configured — using an in-memory database. Accounts "
+            "you create will vanish when the server restarts. Set `MONGO_URI` "
+            "in `.env` to persist.",
+            icon="🗄️",
+        )
+
+    tab_signin, tab_signup, tab_google = st.tabs(["🔐 Sign in", "🆕 Create account", "🟢 Google"])
+
+    with tab_signin:
+        with st.form("signin_form", clear_on_submit=False):
+            u = st.text_input("Username", key="signin_username")
+            p = st.text_input("Password", type="password", key="signin_password")
+            submit = st.form_submit_button("Sign in", type="primary", use_container_width=True)
+            if submit:
+                try:
+                    user = _users.sign_in(username=u, password=p)
+                    st.session_state.user = {"username": user.username, "email": user.email,
+                                             "provider": user.provider}
+                    st.rerun()
+                except AuthError as e:
+                    st.error(str(e), icon="🚫")
+
+    with tab_signup:
+        with st.form("signup_form", clear_on_submit=False):
+            u = st.text_input("Username", key="signup_username",
+                              help="Letters, digits, underscores; lower-cased on save.")
+            e = st.text_input("Email (optional)", key="signup_email")
+            p = st.text_input("Password (min. 8 chars)", type="password", key="signup_password")
+            p2 = st.text_input("Confirm password", type="password", key="signup_password2")
+            submit = st.form_submit_button("Create account", type="primary", use_container_width=True)
+            if submit:
+                if p != p2:
+                    st.error("Passwords do not match.", icon="🚫")
+                else:
+                    try:
+                        user = _users.sign_up(username=u, password=p, email=e or None)
+                        st.session_state.user = {"username": user.username, "email": user.email,
+                                                 "provider": user.provider}
+                        st.success("Account created — you're signed in.", icon="✅")
+                        st.rerun()
+                    except AuthError as ex:
+                        st.error(str(ex), icon="🚫")
+
+    with tab_google:
+        client_id = os.getenv("GOOGLE_CLIENT_ID", "").strip()
+        client_secret = os.getenv("GOOGLE_CLIENT_SECRET", "").strip()
+        if not client_id or not client_secret:
+            st.info(
+                "Google sign-in requires `GOOGLE_CLIENT_ID` and `GOOGLE_CLIENT_SECRET` "
+                "in your `.env`.\n\n"
+                "**One-time setup:**\n"
+                "1. Go to <https://console.cloud.google.com/apis/credentials> and "
+                "   create an OAuth 2.0 Client ID (type: Web application).\n"
+                "2. Add your app URL to *Authorized redirect URIs* — for local use, "
+                "   `http://localhost:8501`.\n"
+                "3. Paste the Client ID and Secret into `.env`, then restart Streamlit.\n\n"
+                "For the Cloudflare tunnel URL, you need a **named** tunnel with a stable "
+                "hostname (Cloudflare Zero Trust) — the random Quick Tunnel URL changes "
+                "every restart, which Google rejects. See DEPLOY.md.",
+                icon="🔧",
+            )
+        else:
+            try:
+                from streamlit_oauth import OAuth2Component
+            except Exception:
+                st.error(
+                    "Install `streamlit-oauth` to enable Google sign-in: "
+                    "`pip install streamlit-oauth`",
+                    icon="📦",
+                )
+            else:
+                oauth = OAuth2Component(
+                    client_id=client_id,
+                    client_secret=client_secret,
+                    authorize_endpoint="https://accounts.google.com/o/oauth2/v2/auth",
+                    token_endpoint="https://oauth2.googleapis.com/token",
+                    refresh_token_endpoint="https://oauth2.googleapis.com/token",
+                    revoke_token_endpoint="https://oauth2.googleapis.com/revoke",
+                )
+                result = oauth.authorize_button(
+                    name="Sign in with Google",
+                    icon="https://www.google.com/favicon.ico",
+                    redirect_uri=os.getenv("GOOGLE_REDIRECT_URI", "http://localhost:8501"),
+                    scope="openid email profile",
+                    key="google_oauth",
+                    use_container_width=True,
+                )
+                if result and "token" in result:
+                    id_token = result["token"].get("id_token", "")
+                    try:
+                        # Verify id_token
+                        from google.auth.transport import requests as g_requests
+                        from google.oauth2 import id_token as g_idtoken
+                        claims = g_idtoken.verify_oauth2_token(
+                            id_token, g_requests.Request(), client_id
+                        )
+                        user = _users.upsert_google(
+                            google_sub=claims["sub"],
+                            email=claims.get("email", ""),
+                            name=claims.get("name"),
+                        )
+                        st.session_state.user = {"username": user.username, "email": user.email,
+                                                 "provider": user.provider}
+                        st.rerun()
+                    except Exception as ex:
+                        st.error(f"Google verification failed: {ex}", icon="🚫")
+
+
+# ---------------------------------------------------------------------------
+# Auth wall
+# ---------------------------------------------------------------------------
+
+if not st.session_state.user:
+    _render_auth()
+    st.stop()
+
+CURRENT_USER = st.session_state.user
+USERNAME = CURRENT_USER["username"]
+
+# ---------------------------------------------------------------------------
+# Sidebar (post-login)
 # ---------------------------------------------------------------------------
 
 with st.sidebar:
-    st.markdown("### 🧭 Compass")
-    st.caption("Developer onboarding, in minutes.")
+    st.markdown(f"### 🧭 Compass")
+    st.caption(f"Signed in as **{USERNAME}**"
+               + (f" · {CURRENT_USER['email']}" if CURRENT_USER.get("email") else ""))
+    if st.button("Sign out", use_container_width=True, disabled=st.session_state.running):
+        st.session_state.user = None
+        st.session_state.pack_dir = None
+        st.session_state.last_pack_totals = None
+        st.rerun()
+
     st.divider()
 
     st.markdown("**Bob API key**")
     bob_key = st.text_input(
-        "BOB_API_KEY",
-        value=os.getenv("BOB_API_KEY", ""),
-        type="password",
-        label_visibility="collapsed",
-        help="Get one at https://bob.ibm.com → API keys. Used only for real runs; the Demo tab does not need it.",
+        "BOB_API_KEY", value=os.getenv("BOB_API_KEY", ""),
+        type="password", label_visibility="collapsed",
+        help="Get one at https://bob.ibm.com → API keys.",
         disabled=st.session_state.running,
     )
     if bob_key:
         os.environ["BOB_API_KEY"] = bob_key
-        st.success("Bob key loaded for this session.", icon="✅")
+        st.success("Bob key loaded.", icon="✅")
     else:
-        st.info("Paste your Bob key above to enable real runs. The Demo tab works without it.", icon="🔑")
+        st.info("Paste your Bob key to enable real runs.", icon="🔑")
 
+    # --- Cost / usage panel ---
     st.divider()
+    totals = _runs.totals_for(USERNAME)
+    st.markdown("**Your usage**")
+    c1, c2 = st.columns(2)
+    c1.metric("Runs", totals["runs"])
+    c2.metric("Bobcoins", f"{totals['total_bobcoins']:.4f}")
+    st.caption(f"Successful: {totals['successful_runs']} · "
+               f"Tokens: {totals['total_tokens']:,}")
 
-    # --- Health check ---
+    # --- Health ---
     import shutil as _shutil
+    st.divider()
     checks = {
-        "Bob CLI on PATH": _shutil.which("bob") is not None,
-        "Git on PATH":     _shutil.which("git") is not None,
-        "Node on PATH":    _shutil.which("node") is not None,
-        "BOB_API_KEY set": bool(os.environ.get("BOB_API_KEY")),
+        "Bob CLI":       _shutil.which("bob") is not None,
+        "Git":           _shutil.which("git") is not None,
+        "Node":          _shutil.which("node") is not None,
+        "BOB_API_KEY":   bool(os.environ.get("BOB_API_KEY")),
+        "Real MongoDB":  is_real_mongo(),
     }
     st.markdown("**Environment**")
     for label, ok in checks.items():
         st.markdown(f"- {'✅' if ok else '⚠️'} {label}")
-
-    st.divider()
-    with st.expander("What token do I need?"):
-        st.markdown(
-            "**Only `BOB_API_KEY`** — from `bob.ibm.com → API keys`. "
-            "Paste it above and hit Run.\n\n"
-            "There is no separate 'Compass token' for the UI. "
-            "`COMPASS_API_TOKEN` is only needed if you also run `compass serve` "
-            "(the FastAPI backend for watsonx Orchestrate). The server auto-generates "
-            "one on first launch if you don't set it."
-        )
-    st.caption("Hackathon: IBM Bob 2.0 · lablab.ai · MIT-licensed.")
+    st.caption("MIT-licensed · IBM Bob 2.0 · lablab.ai")
 
 # ---------------------------------------------------------------------------
 # Hero
@@ -143,7 +290,7 @@ st.markdown(
       <div>
         <span class="compass-badge">IBM Bob 2.0</span>
         <span class="compass-badge">watsonx Orchestrate</span>
-        <span class="compass-badge">watsonx.ai</span>
+        <span class="compass-badge">MongoDB</span>
         <span class="compass-badge">MIT</span>
       </div>
     </div>
@@ -168,7 +315,6 @@ def _pack_to_zip_bytes(pack_dir: Path) -> bytes:
 
 
 def _extract_mermaid(arch_md: str) -> tuple[str, str]:
-    """Return (mermaid_source, arch_md_without_mermaid_block)."""
     if "```mermaid" not in arch_md:
         return "", arch_md
     head, _, tail = arch_md.partition("```mermaid")
@@ -177,7 +323,6 @@ def _extract_mermaid(arch_md: str) -> tuple[str, str]:
 
 
 def _render_mermaid(source: str, height: int = 460) -> None:
-    """Render Mermaid via a small inline HTML component."""
     html = f"""
     <div style="background:white; padding:8px; border-radius:8px;">
       <div class="mermaid">{source}</div>
@@ -190,13 +335,11 @@ def _render_mermaid(source: str, height: int = 460) -> None:
 
 @st.cache_data(show_spinner=False)
 def _mermaid_png_bytes(source: str) -> bytes | None:
-    """Render Mermaid to PNG via the public mermaid.ink service."""
     if not source.strip():
         return None
     try:
         encoded = base64.urlsafe_b64encode(source.encode("utf-8")).decode("ascii").rstrip("=")
-        url = f"https://mermaid.ink/img/{encoded}?type=png&bgColor=white"
-        r = httpx.get(url, timeout=15)
+        r = httpx.get(f"https://mermaid.ink/img/{encoded}?type=png&bgColor=white", timeout=15)
         if r.status_code == 200 and r.headers.get("content-type", "").startswith("image/"):
             return r.content
     except Exception:
@@ -205,31 +348,20 @@ def _mermaid_png_bytes(source: str) -> bytes | None:
 
 
 def _folder_picker_dialog() -> tuple[str | None, str | None]:
-    """Open a native folder picker on the Streamlit host machine.
-
-    Returns (chosen_path, error_message). Exactly one is non-None:
-      * (path, None) — a folder was picked
-      * (None, "cancelled") — the dialog opened and the user cancelled
-      * (None, "<other>") — tkinter unavailable, no display, etc.
-    """
     try:
         import tkinter as tk
         from tkinter import filedialog
     except Exception as exc:
         return None, f"tkinter unavailable: {exc}"
-
     try:
         root = tk.Tk()
         root.withdraw()
-        # Bring the dialog to the front on Windows. -topmost + focus_force is
-        # the combination that actually works when Streamlit is behind Chrome.
         root.attributes("-topmost", True)
         root.after(100, lambda: root.focus_force())
         path = filedialog.askdirectory(master=root, title="Choose a repo folder for Compass")
         root.destroy()
     except Exception as exc:
         return None, f"picker failed: {exc}"
-
     if not path:
         return None, "cancelled"
     return path, None
@@ -241,126 +373,104 @@ def _read(path: Path) -> str:
 
 def _render_pack(pack_dir: Path) -> None:
     """Render a completed onboarding pack — metrics, downloads, and content sub-tabs."""
-
-    # --- Metrics ---
     report_path = pack_dir / "report.json"
-    total_time = total_bob = ""
+    report = {}
     try:
         report = json.loads(_read(report_path)) if report_path.exists() else {}
-        total_time = f"{report.get('total_wall_clock_seconds', 0):.1f}s"
-        # bobcoins spent lives in the run terminal; expose via the report if we recorded it
     except Exception:
-        report = {}
+        pass
+
+    kind = (report.get("inventory") or {}).get("content_kind", "unknown")
+    if kind != "code" and kind != "unknown":
+        st.info(
+            f"This upload looks like **{kind}**, not a codebase. Compass produced a "
+            f"content overview instead of an architecture — the description tab tells "
+            f"you what's in there and how to explore it.",
+            icon="📚",
+        )
 
     st.success(f"Pack written to `{pack_dir}`", icon="✅")
 
     m1, m2, m3, m4 = st.columns(4)
-    m1.metric("Wall clock",  total_time or "—")
-    m2.metric("Subagents",    str(len(report.get("subagents", []))))
-    m3.metric("Total tokens", str(report.get("total_tokens", 0)))
-    m4.metric("Repo",         (report.get("repo") or "—")[:24] + ("…" if len(report.get("repo") or "") > 24 else ""))
+    m1.metric("Wall clock",  f"{report.get('total_wall_clock_seconds', 0):.1f}s")
+    m2.metric("Bobcoins",     f"{report.get('total_bobcoins', 0):.4f}")
+    m3.metric("Tokens",       f"{report.get('total_tokens', 0):,}")
+    m4.metric("Content",      kind.capitalize())
 
-    # --- Downloads section (its own bordered box) ---
+    # --- Downloads ---
     with st.container(border=True):
-        st.markdown("#### ⬇️  Downloads")
-
+        st.markdown("#### ⬇️ Downloads")
         arch_md = _read(pack_dir / "ARCHITECTURE.md")
         mermaid_src, _ = _extract_mermaid(arch_md)
 
         d1, d2, d3, d4 = st.columns(4)
-        d1.download_button(
-            "🗂️  Full pack (.zip)", data=_pack_to_zip_bytes(pack_dir),
-            file_name=f"{pack_dir.name}.zip", mime="application/zip",
-            use_container_width=True,
-        )
-        d2.download_button(
-            "📋 OVERVIEW.md", data=_read(pack_dir / "OVERVIEW.md"),
-            file_name="OVERVIEW.md", mime="text/markdown",
-            use_container_width=True, disabled=not (pack_dir / "OVERVIEW.md").exists(),
-        )
-        d3.download_button(
-            "🛠️ DEV_LOOP.md", data=_read(pack_dir / "DEV_LOOP.md"),
-            file_name="DEV_LOOP.md", mime="text/markdown",
-            use_container_width=True, disabled=not (pack_dir / "DEV_LOOP.md").exists(),
-        )
-        d4.download_button(
-            "🎯 STARTER_TASKS.md", data=_read(pack_dir / "STARTER_TASKS.md"),
-            file_name="STARTER_TASKS.md", mime="text/markdown",
-            use_container_width=True, disabled=not (pack_dir / "STARTER_TASKS.md").exists(),
-        )
+        d1.download_button("🗂️ Full pack (.zip)", data=_pack_to_zip_bytes(pack_dir),
+                           file_name=f"{pack_dir.name}.zip", mime="application/zip",
+                           use_container_width=True)
+        d2.download_button("📋 OVERVIEW.md", data=_read(pack_dir / "OVERVIEW.md"),
+                           file_name="OVERVIEW.md", mime="text/markdown",
+                           use_container_width=True,
+                           disabled=not (pack_dir / "OVERVIEW.md").exists())
+        d3.download_button("🛠️ DEV_LOOP.md", data=_read(pack_dir / "DEV_LOOP.md"),
+                           file_name="DEV_LOOP.md", mime="text/markdown",
+                           use_container_width=True,
+                           disabled=not (pack_dir / "DEV_LOOP.md").exists())
+        d4.download_button("🎯 STARTER_TASKS.md", data=_read(pack_dir / "STARTER_TASKS.md"),
+                           file_name="STARTER_TASKS.md", mime="text/markdown",
+                           use_container_width=True,
+                           disabled=not (pack_dir / "STARTER_TASKS.md").exists())
 
         e1, e2, e3, e4 = st.columns(4)
-        e1.download_button(
-            "🗺️ ARCHITECTURE.md", data=arch_md, file_name="ARCHITECTURE.md",
-            mime="text/markdown", use_container_width=True, disabled=not arch_md,
-        )
-        e2.download_button(
-            "📖 TOUR.md", data=_read(pack_dir / "TOUR.md"),
-            file_name="TOUR.md", mime="text/markdown",
-            use_container_width=True, disabled=not (pack_dir / "TOUR.md").exists(),
-        )
-        e3.download_button(
-            "📊 report.json", data=_read(pack_dir / "report.json"),
-            file_name="report.json", mime="application/json",
-            use_container_width=True, disabled=not (pack_dir / "report.json").exists(),
-        )
-        # --- Architecture as a standalone PNG ---
-        png_bytes = _mermaid_png_bytes(mermaid_src) if mermaid_src else None
-        e4.download_button(
-            "🖼️ Architecture (PNG)",
-            data=png_bytes or b"",
-            file_name="architecture.png",
-            mime="image/png",
-            use_container_width=True,
-            disabled=png_bytes is None,
-            help="Rendered via mermaid.ink" if png_bytes else "No Mermaid block in ARCHITECTURE.md",
-        )
+        e1.download_button("🗺️ ARCHITECTURE.md", data=arch_md, file_name="ARCHITECTURE.md",
+                           mime="text/markdown", use_container_width=True, disabled=not arch_md)
+        e2.download_button("📖 TOUR.md", data=_read(pack_dir / "TOUR.md"),
+                           file_name="TOUR.md", mime="text/markdown",
+                           use_container_width=True,
+                           disabled=not (pack_dir / "TOUR.md").exists())
+        e3.download_button("📊 report.json", data=_read(pack_dir / "report.json"),
+                           file_name="report.json", mime="application/json",
+                           use_container_width=True,
+                           disabled=not (pack_dir / "report.json").exists())
+        png = _mermaid_png_bytes(mermaid_src) if mermaid_src else None
+        e4.download_button("🖼️ Architecture (PNG)", data=png or b"",
+                           file_name="architecture.png", mime="image/png",
+                           use_container_width=True, disabled=png is None,
+                           help="Rendered via mermaid.ink" if png
+                                else "No Mermaid block in ARCHITECTURE.md")
 
-    # --- Content section (its own bordered box, tabbed) ---
+    # --- Content ---
     with st.container(border=True):
         st.markdown("#### 📚 Content")
-
-        subtabs = st.tabs([
-            "📋 Overview", "🗺️ Architecture", "🛠️ Dev loop",
-            "📖 Tour", "🎯 Starter tasks", "📊 Report",
-        ])
-
+        subtabs = st.tabs(["📋 Overview", "🗺️ Architecture", "🛠️ Dev loop",
+                           "📖 Tour", "🎯 Starter tasks", "📊 Report"])
         with subtabs[0]:
-            st.markdown(f"<div class='compass-answer'>{_read(pack_dir / 'OVERVIEW.md') or '_(empty)_'}</div>",
-                        unsafe_allow_html=False)
             st.markdown(_read(pack_dir / "OVERVIEW.md") or "_(empty)_")
-
         with subtabs[1]:
             mermaid_src, rest = _extract_mermaid(_read(pack_dir / "ARCHITECTURE.md"))
             if mermaid_src:
                 st.caption("Live architecture diagram (rendered from Mermaid):")
                 _render_mermaid(mermaid_src)
-                st.caption("Download this diagram as a PNG from the Downloads section above.")
                 st.divider()
             st.markdown(rest or "_(empty)_")
-
         with subtabs[2]:
             st.markdown(_read(pack_dir / "DEV_LOOP.md") or "_(empty)_")
-
         with subtabs[3]:
             st.markdown(_read(pack_dir / "TOUR.md") or "_(empty)_")
-
         with subtabs[4]:
             st.markdown(_read(pack_dir / "STARTER_TASKS.md") or "_(empty)_")
-
         with subtabs[5]:
-            if report_path.exists():
+            if report:
                 st.json(report)
             else:
                 st.info("No report.json in this pack.")
 
 
 # ---------------------------------------------------------------------------
-# Tabs
+# Tabs (post-login)
 # ---------------------------------------------------------------------------
 
-tab_onboard, tab_ask, tab_demo, tab_about = st.tabs(
-    ["🚀 Onboard", "💬 Ask this repo", "🎬 Demo (no key)", "ℹ️ About & deploy"]
+tab_onboard, tab_ask, tab_demo, tab_history, tab_about = st.tabs(
+    ["🚀 Onboard", "💬 Ask this repo", "🎬 Demo (no key)", "🕘 History", "ℹ️ About & deploy"]
 )
 
 # ==== ONBOARD =============================================================
@@ -368,16 +478,14 @@ with tab_onboard:
     running = st.session_state.running
 
     st.subheader("Onboard a repository")
-    st.caption("Real runs need `BOB_API_KEY` in the sidebar and the `bob` CLI on the host running Compass.")
+    st.caption("Real runs need `BOB_API_KEY` in the sidebar and the `bob` CLI on the host.")
 
     with st.container(border=True):
         st.markdown("**1. Source**")
         src_kind = st.radio(
             "Where does the repo live?",
             options=["Git URL", "Local folder", "Upload .zip"],
-            horizontal=True,
-            key="src_kind",
-            disabled=running,
+            horizontal=True, key="src_kind", disabled=running,
             label_visibility="collapsed",
         )
 
@@ -387,18 +495,10 @@ with tab_onboard:
             repo_spec = st.text_input(
                 "Repository URL",
                 placeholder="https://github.com/pallets/flask",
-                help="Anything `git clone` accepts: HTTPS, SSH, GitLab, Bitbucket, self-hosted…",
-                disabled=running,
-                key="git_url",
+                disabled=running, key="git_url",
             )
         elif src_kind == "Local folder":
-            # The text_input owns the "local_path" widget key. To let the
-            # Browse button also write to it we mutate session_state inside an
-            # on_click callback (which fires BEFORE the widget re-instantiates
-            # on the next rerun; writing to a widget-owned key after that
-            # raises StreamlitWidgetAlreadyInstantiatedError).
             st.session_state.setdefault("local_path", "")
-            st.session_state.setdefault("last_browse_msg", None)
 
             def _pick_local_folder() -> None:
                 chosen, err = _folder_picker_dialog()
@@ -413,44 +513,31 @@ with tab_onboard:
             col_path, col_browse = st.columns([5, 1])
             with col_path:
                 repo_spec = st.text_input(
-                    "Path to a local folder",
-                    placeholder=r"D:\work\my-service",
-                    disabled=running,
-                    key="local_path",
+                    "Path to a local folder", placeholder=r"D:\work\my-service",
+                    disabled=running, key="local_path",
                 )
             with col_browse:
-                st.write("")  # vertical spacer aligns with the input
-                st.button(
-                    "📁 Browse…",
-                    disabled=running,
-                    use_container_width=True,
-                    help="Opens on the machine running Streamlit (this laptop). "
-                         "If the dialog does not appear, it may be behind the browser — Alt-Tab.",
-                    on_click=_pick_local_folder,
-                )
+                st.write("")
+                st.button("📁 Browse…", disabled=running, use_container_width=True,
+                          on_click=_pick_local_folder)
             st.caption(
-                "💡 The folder picker opens on **the machine running Streamlit** — "
-                "not on the device you're viewing this page from. "
-                "If a dialog doesn't appear, Alt-Tab to it, or just paste the path directly."
+                "💡 The picker opens on **the machine running Streamlit** — not on "
+                "the device you're viewing this from. Alt-Tab if you don't see it, "
+                "or paste the path directly."
             )
             msg = st.session_state.get("last_browse_msg")
             if msg:
                 level, text = msg
-                if level == "success":
-                    st.success(text, icon="📁")
-                elif level == "info":
-                    st.info(text, icon="ℹ️")
-                else:
-                    st.error(f"Browse failed — {text}. Paste the path directly instead.", icon="⚠️")
+                {"success": st.success, "info": st.info, "error": st.error}[level](
+                    text if level != "error" else f"Browse failed — {text}",
+                    icon={"success": "📁", "info": "ℹ️", "error": "⚠️"}[level],
+                )
             if st.session_state.local_path:
                 st.caption(f"Current path: `{st.session_state.local_path}`")
         else:
             uploaded = st.file_uploader(
-                "Upload a .zip of the repository",
-                type=["zip"],
-                disabled=running,
-                help="The zip is extracted into an isolated workspace; your original is never modified.",
-                key="zip_upload",
+                "Upload a .zip of the repository", type=["zip"],
+                disabled=running, key="zip_upload",
             )
             if uploaded is not None:
                 tmp = Path(tempfile.mkdtemp(prefix="compass-upload-"))
@@ -476,51 +563,51 @@ with tab_onboard:
 
     ready = bool(repo_spec and str(repo_spec).strip())
     run_col, help_col = st.columns([1, 4])
-    run_clicked = run_col.button(
-        "🚀 Run Compass", type="primary",
-        disabled=(not ready) or running,
-        use_container_width=True,
-    )
+    run_clicked = run_col.button("🚀 Run Compass", type="primary",
+                                 disabled=(not ready) or running, use_container_width=True)
     if not ready and not running:
         help_col.info("Choose a source above to enable the Run button.", icon="👆")
 
-    # --- Kick off the run inline ------------------------------------------
     if run_clicked:
         if not os.environ.get("BOB_API_KEY"):
             st.error("No BOB_API_KEY. Paste one into the sidebar, or use the **Demo** tab.", icon="🔑")
         else:
             st.session_state.running = True
             st.session_state.last_error = None
-            st.session_state.progress_lines = []
 
             output_dir = (Path.cwd() / output_name).resolve()
             steps = [
                 ("clone", "Resolving source"),
                 ("scout", "Scout — inventory"),
                 ("cartographer", "Cartographer — architecture"),
-                ("devloop", "DevLoopRunner — install / test (slowest step)"),
+                ("devloop", "DevLoopRunner — install / test (slowest)"),
                 ("guide", "Guide — tour + starter tasks"),
                 ("done", "Done"),
             ]
-            step_map = {k: v for k, v in steps}
             state: dict[str, str] = {}
 
-            with st.status("Running Compass — you can't change the inputs above until this finishes.",
+            import time as _time
+            t_start = _time.perf_counter()
+            pack_obj = None
+            error_msg = None
+
+            with st.status("Running Compass — inputs are locked until this finishes.",
                            expanded=True) as status:
+                placeholder = st.empty()
+
                 def render_progress() -> None:
                     lines = []
                     for k, label in steps:
                         v = state.get(k)
                         if v is None:
-                            icon = "⏳"; text = "…"
+                            icon, text = "⏳", "…"
                         elif "done" in v.lower() or k == "done":
-                            icon = "✅"; text = v
+                            icon, text = "✅", v
                         else:
-                            icon = "🔵"; text = v
+                            icon, text = "🔵", v
                         lines.append(f"{icon} **{label}** — {text}")
                     placeholder.markdown("\n\n".join(lines))
 
-                placeholder = st.empty()
                 render_progress()
 
                 def on_progress(step: str, msg: str) -> None:
@@ -529,27 +616,48 @@ with tab_onboard:
 
                 try:
                     from compass.application.orchestrator import Orchestrator
-                    Orchestrator(on_progress=on_progress).run(
+                    pack_obj = Orchestrator(on_progress=on_progress).run(
                         repo=str(repo_spec),
                         role=None if role == "(any)" else role,
                         difficulty=difficulty,
-                        output_dir=output_dir,
-                        allow_large=False,
+                        output_dir=output_dir, allow_large=False,
                     )
                     st.session_state.pack_dir = str(output_dir)
                     status.update(label="Compass run complete ✅", state="complete", expanded=False)
                 except Exception as exc:
-                    st.session_state.last_error = f"{type(exc).__name__}: {exc}"
+                    error_msg = f"{type(exc).__name__}: {exc}"
+                    st.session_state.last_error = error_msg
                     status.update(label=f"Run failed: {exc}", state="error", expanded=True)
                 finally:
                     st.session_state.running = False
 
+            # Record the run to MongoDB (success or failure)
+            try:
+                _runs.record(
+                    username=USERNAME,
+                    repo=str(repo_spec),
+                    role=None if role == "(any)" else role,
+                    difficulty=difficulty,
+                    pack_dir=str(output_dir),
+                    duration_seconds=(pack_obj.total_wall_clock_seconds if pack_obj
+                                      else _time.perf_counter() - t_start),
+                    total_bobcoins=(pack_obj.total_bobcoins if pack_obj else 0.0),
+                    subagent_bobcoins={r.name: r.bobcoins for r in pack_obj.subagents}
+                                     if pack_obj else {},
+                    total_tokens=(pack_obj.total_tokens if pack_obj else 0),
+                    content_kind=(pack_obj.inventory.content_kind if pack_obj else "unknown"),
+                    status="success" if pack_obj else "failed",
+                    error=error_msg,
+                )
+            except Exception:
+                pass  # persistence is best-effort; UI still shows the pack
+
             st.rerun()
 
-    # --- Render the last completed pack (if any) --------------------------
     if st.session_state.last_error:
         st.error(f"Last run failed — {st.session_state.last_error}", icon="🛑")
-        st.caption("Common causes: `bob` CLI not on PATH, Bob key invalid, or the repo needs longer than the 300 s timeout.")
+        st.caption("Common causes: `bob` CLI not on PATH, Bob key invalid, or "
+                   "the repo needs longer than the 300 s per-subagent timeout.")
     elif st.session_state.pack_dir:
         st.divider()
         _render_pack(Path(st.session_state.pack_dir))
@@ -557,15 +665,13 @@ with tab_onboard:
 # ==== ASK =================================================================
 with tab_ask:
     st.subheader("Ask this repo")
-    st.caption("Grounded Q&A over an existing pack. Answers must cite `file:line` from the pack's `notes/*.json`.")
-
+    st.caption("Grounded Q&A over an existing pack. Answers must cite `file:line` from `notes/*.json`.")
     with st.container(border=True):
         default_pack = st.session_state.pack_dir or str(DEFAULT_OUTPUT)
         pack_dir = Path(st.text_input("Pack directory", value=default_pack))
         question = st.text_area("Your question",
                                 placeholder="Where does routing happen?", height=90)
         ask_clicked = st.button("🔍 Ask", type="primary", disabled=not question.strip())
-
     if ask_clicked:
         try:
             from compass.application.ask import answer_question
@@ -578,13 +684,10 @@ with tab_ask:
                     with st.expander(f"Citations ({len(ans.citations)})", expanded=True):
                         for c in ans.citations:
                             st.markdown(f"- `{c.file}:{c.line_start}-{c.line_end}` — {c.snippet}")
-                else:
-                    st.caption("No citations returned.")
         except NotImplementedError:
             st.warning(
-                "`/ask` is scaffolded but not yet wired. Next step: BM25 over `notes/*.json` "
-                "and a grounded LLM call. Track this in `src/compass/application/ask.py`.",
-                icon="🚧",
+                "`/ask` is scaffolded but not yet wired. Next step: BM25 over "
+                "`notes/*.json` and a grounded LLM call.", icon="🚧",
             )
         except FileNotFoundError as e:
             st.error(str(e), icon="📁")
@@ -592,24 +695,59 @@ with tab_ask:
 # ==== DEMO ================================================================
 with tab_demo:
     st.subheader("Demo — see what a pack looks like")
-    st.caption("Uses a canned fixture. No Bob call, no network, no API key.")
-
+    st.caption("Canned fixture. No Bob call, no network, no API key.")
     with st.container(border=True):
-        demo_dir = st.text_input(
-            "Where to write the demo pack",
-            value=str((Path.cwd() / "onboarding_demo").resolve()),
-            key="demo_dir",
-        )
+        demo_dir = st.text_input("Where to write the demo pack",
+                                 value=str((Path.cwd() / "onboarding_demo").resolve()),
+                                 key="demo_dir")
         if st.button("🎬 Generate demo pack", type="primary"):
             from compass.application.demo import write_demo_pack
             path = Path(demo_dir)
             write_demo_pack(path)
             st.session_state.pack_dir = str(path)
             st.rerun()
-
     if st.session_state.pack_dir and Path(st.session_state.pack_dir) == Path(demo_dir):
         st.divider()
         _render_pack(Path(st.session_state.pack_dir))
+
+# ==== HISTORY =============================================================
+with tab_history:
+    st.subheader("Your run history")
+    st.caption(f"Everything you've onboarded as **{USERNAME}**, newest first.")
+    rows = _runs.list_for(USERNAME, limit=50)
+    if not rows:
+        st.info("No runs yet. Run something from the Onboard tab and it'll show up here.", icon="🗄️")
+    else:
+        totals = _runs.totals_for(USERNAME)
+        h1, h2, h3, h4 = st.columns(4)
+        h1.metric("Runs", totals["runs"])
+        h2.metric("Successful", totals["successful_runs"])
+        h3.metric("Total Bobcoins", f"{totals['total_bobcoins']:.4f}")
+        h4.metric("Total tokens", f"{totals['total_tokens']:,}")
+        st.divider()
+        for r in rows:
+            with st.container(border=True):
+                title = r.get("repo") or "(unknown)"
+                started = r.get("started_at")
+                if isinstance(started, datetime):
+                    started_s = started.strftime("%Y-%m-%d %H:%M UTC")
+                else:
+                    started_s = str(started or "")
+                status_icon = "✅" if r.get("status") == "success" else "❌"
+                st.markdown(f"**{status_icon} {title}** &nbsp; · &nbsp; "
+                            f"<span class='muted'>{started_s}</span>",
+                            unsafe_allow_html=True)
+                c1, c2, c3, c4 = st.columns(4)
+                c1.metric("Duration", f"{r.get('duration_seconds', 0):.1f}s")
+                c2.metric("Bobcoins", f"{r.get('total_bobcoins', 0):.4f}")
+                c3.metric("Tokens",   f"{r.get('total_tokens', 0):,}")
+                c4.metric("Content",  (r.get("content_kind") or "?").capitalize())
+                if r.get("subagent_bobcoins"):
+                    parts = ", ".join(f"{k}: {v:.4f}"
+                                      for k, v in r["subagent_bobcoins"].items())
+                    st.caption(f"Per-subagent Bobcoins — {parts}")
+                if r.get("error"):
+                    st.caption(f"Error: `{r['error']}`")
 
 # ==== ABOUT ===============================================================
 with tab_about:
@@ -619,22 +757,19 @@ with tab_about:
 Compass turns *"first productive commit in weeks"* into *"first productive commit in hours."*
 
 **Four Bob subagents** run in sequence:
-
-1. **Scout** — inventory (languages, package managers, entry points).
-2. **Cartographer** — architecture map with evidence for every edge.
-3. **DevLoopRunner** — install / build / test commands Bob *actually ran*.
+1. **Scout** — inventory + content-kind (code / docs / media / mixed).
+2. **Cartographer** — architecture map with evidence.
+3. **DevLoopRunner** — install / build / test Bob *actually* ran.
 4. **Guide** — reading tour + three starter tasks with hint ladders.
 
-**Sources it accepts:** any Git URL, a local folder (with a native picker on this machine), or a `.zip` upload.
-Local paths and ZIPs are copied into an isolated workspace — your originals are never touched.
+**Sources:** any Git URL, a local folder (with a native picker), or a `.zip` upload.
 
-**One token, one place.** The only credential Compass needs is `BOB_API_KEY`
-(from `bob.ibm.com → API keys`). Paste it into the sidebar. There is no
-separate "Compass token" for the UI.
+**Accounts + history** stored in MongoDB — set `MONGO_URI` in `.env`
+for real persistence, or leave it blank for an in-memory dev fallback.
+Every run records the Bobcoins each subagent spent so you can see costs
+per project and lifetime totals in the sidebar.
 
-**Deploy:** see `DEPLOY.md` in the repo. The recommended path is the
-`scripts/serve_public.ps1` launcher: it starts Streamlit + a Cloudflare
-Quick Tunnel and prints a public `https://…trycloudflare.com` URL — the link
-to paste into your lablab submission.
+**Deploy:** see `DEPLOY.md`. The recommended path for a live judging link
+is `scripts/serve_public.ps1` (Streamlit + Cloudflare Quick Tunnel).
         """
     )

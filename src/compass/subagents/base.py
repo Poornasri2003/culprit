@@ -85,6 +85,7 @@ class Subagent(ABC, Generic[TOutput]):
             duration_seconds=time.perf_counter() - t0,
             tokens_prompt=usage.prompt_tokens,
             tokens_completion=usage.completion_tokens,
+            bobcoins=usage.bobcoins,
             retries=retries,
             ok=True,
         )
