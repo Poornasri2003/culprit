@@ -1,114 +1,92 @@
 # Deploying Compass
 
-For a Bob-agent hackathon there is one right answer and a couple of fallbacks.
+**Official submission link: Streamlit Community Cloud.** This document explains what works there, what doesn't, why, and how to show the rest.
 
-**TL;DR — the right answer:**
+## The constraint, confirmed
 
-1. Run Compass locally.
-2. Expose it via a **Cloudflare Quick Tunnel** (free, zero signup).
-3. Paste the tunnel's `https://…trycloudflare.com` URL into your lablab submission.
+Compass's real onboarding runs shell out to the `bob` CLI. We tested directly whether this could be auto-installed on any cloud host (the obvious hope: `npm install -g bobshell` inside a container) and confirmed it cannot:
 
-This gives judges a **fully working link** — real Onboard, real Ask, real Bob — as long as your machine is online during judging. It's the correct architecture for any agent that shells out to a locally-authenticated CLI like `bob`.
+- `bobshell` returns a real `404 Not Found` from the public npm registry — it is not published there.
+- The actual `bob` CLI is bundled by **IBM's official "IBM Bob" installer** (a full desktop application), not distributed as a fetchable package.
 
-Streamlit Community Cloud and Hugging Face Spaces are useful *fallbacks* for after the judging window (or as a static "look at the UI" backup), but they cannot run real onboardings because the `bob` binary is not deployable to their runtimes.
+So there is currently no way to make a from-scratch cloud container run real Bob onboardings without first running IBM's official installer on that machine — which rules out Streamlit Community Cloud, Hugging Face Spaces, and any serverless platform for the *real* Onboard flow.
 
----
+This is a distribution constraint, not a bug in Compass. `src/compass/infrastructure/bob_bootstrap.py` documents the investigation in detail and fails with a clear, honest error (rather than a confusing 404) if you ever try.
 
-## 1. The one-command launcher (recommended)
+## What Streamlit Community Cloud DOES give you
 
-Prerequisites (one-time):
+Everything except the real Bob run:
+
+- ✅ **Accounts** — sign up / sign in (bcrypt-hashed passwords in MongoDB Atlas)
+- ✅ **Demo tab** — a full six-file onboarding pack from a canned fixture, no Bob call
+- ✅ **History tab** — past runs, Bobcoin costs, per-subagent breakdown (once you've run something, anywhere)
+- ✅ **Download buttons, Mermaid rendering, architecture PNG export** — all client-independent
+- ⚠️ **Real Onboard** — shows a clear warning banner up front, and a clean error if you click Run anyway. This is intentional, not a bug: the app tells you exactly why, rather than hanging or crashing.
+
+## 1. Deploy to Streamlit Community Cloud
+
+1. Push this repo to GitHub (already done: `github.com/Poornasri2003/culprit`, or rename it to `compass` if you prefer — the redirect is automatic).
+2. Go to <https://share.streamlit.io/> and sign in with GitHub.
+3. Click **Create app** → **"Yup, I have an app"** (deploy from existing repo).
+4. Fill in:
+   - Repository: `Poornasri2003/culprit`
+   - Branch: `main`
+   - Main file path: `streamlit_app.py`
+5. Click **"Advanced settings…"** → **Secrets**, and paste:
+   ```toml
+   MONGO_URI = "mongodb+srv://<user>:<url-encoded-password>@<cluster>.mongodb.net/?appName=Cluster0"
+   MONGO_DB = "compass"
+
+   # Optional — only if you set up Google sign-in (see .env.example for the GCP steps)
+   # GOOGLE_CLIENT_ID = "..."
+   # GOOGLE_CLIENT_SECRET = "..."
+   # GOOGLE_REDIRECT_URI = "https://<your-app>.streamlit.app"
+
+   # Deliberately omitted: BOB_API_KEY. There is no working `bob` CLI on this
+   # host regardless of the key, so setting it here would be misleading.
+   ```
+   Remember to URL-encode any `@` in your Mongo password as `%40` (see `.env.example`).
+6. Click **Deploy**. First build takes 2-3 minutes (installs from `requirements.txt` and `packages.txt`).
+
+You'll get a permanent URL like `https://compass-<random>.streamlit.app`. It survives your laptop being off, redeploys automatically on every push to `main`, and is what you paste into the lablab submission form as the "deployment link."
+
+## 2. Show the real Onboard flow — the video
+
+Since the deployed link can't run real Bob, the second half of the submission is a **local recording**:
 
 ```powershell
-# a) The Bob Shell CLI — check it's on PATH
-bob --version                       # if this fails, install Bob Shell first
-
-# b) Cloudflare's tunnel client
-winget install --id Cloudflare.cloudflared
-
-# c) Compass itself
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 pip install -e .[ui]
-Copy-Item .env.example .env         # then edit .env to add BOB_API_KEY
+Copy-Item .env.example .env      # fill in BOB_API_KEY, MONGO_URI
+streamlit run streamlit_app.py
 ```
 
-Then, every time you want a live demo link:
+Record yourself onboarding a real repo end-to-end: the four subagents running live, the six Markdown files landing on disk, the Bobcoin cost tracking in the sidebar and History tab. This is standard practice for any hackathon agent that depends on a local CLI tool with its own licensing/distribution — judges expect it.
 
-```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\serve_public.ps1
-```
+## 3. If you also want a live, always-on real-Onboard link
 
-That script:
+This needs a host where you've run IBM's official Bob installer yourself — the same one on your Windows machine. Two ways to get there:
 
-1. Launches Streamlit on `http://localhost:8501` in the background.
-2. Starts a Cloudflare Quick Tunnel pointing at it.
-3. Prints a URL like `https://random-name-here.trycloudflare.com`.
+**A. Keep it laptop-based, temporarily public.** Run `scripts/serve_public.ps1` during the specific hours judges are reviewing. It starts Streamlit and a Cloudflare Quick Tunnel and prints a fresh `https://…trycloudflare.com` URL each time. Zero cost, but the URL changes on every restart and your laptop must stay on, plugged in, and connected.
 
-Paste that URL into your lablab submission. Judges click, land on Compass, upload a ZIP, hit Run — the full four-subagent flow runs on your machine using your Bob key. Close the terminal to stop the tunnel.
+**B. A dedicated VPS with Bob's installer run on it.** More setup (needs the IBM Bob installer to support your VPS's OS — check whether IBM ships a Linux build), a small monthly cost, but survives independently of your laptop and gets you a stable IP/domain with no tunnel needed at all. Not yet set up in this repo; ask if you want to pursue it.
 
-**Cloudflare's Quick Tunnel is free, has no signup, no rate limits worth worrying about at hackathon traffic, and gives you a fresh URL every time.** For a stable URL that survives restarts, you can also authenticate cloudflared and create a named tunnel — see the [Cloudflare docs](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/).
+For most hackathon judging windows, **Option A during the window + the Streamlit Cloud link as your permanent submission + the video as backup** covers everything a judge needs to see, without the cost or setup time of a VPS.
 
-**ngrok** is a fine alternative if you already have it configured: `ngrok http 8501`.
+## 4. The FastAPI HTTP surface (`compass serve`) for watsonx Orchestrate
 
-## 2. Streamlit Community Cloud (fallback, UI-only)
-
-Best when you want a link that survives your laptop being off, but you accept that it can only show the Demo tab. Good for a lablab README as "here's the UI, video below for the real thing."
-
-1. Push this repo to GitHub.
-2. <https://share.streamlit.io/> → **New app** → point at `streamlit_app.py`.
-3. Advanced settings → Secrets:
-   ```toml
-   BOB_API_KEY = ""      # blank on purpose — no bob binary on this host
-   COMPASS_API_TOKEN = "any random string"
-   ```
-4. Deploy. `packages.txt` (git) and `pyproject.toml` are picked up automatically.
-
-Deployed link supports: Demo tab, UI navigation, ZIP upload preview, health check (which will show `bob_on_path: false`).
-Deployed link does NOT support: real Onboard, real Ask.
-
-## 3. Hugging Face Spaces (Docker fallback)
-
-Same UI, deployed with a Dockerfile that could — *in theory* — include Bob. Only useful if Bob Shell is available on the npm registry or via a URL your Dockerfile can `curl`.
-
-Skeleton `Dockerfile`:
-
-```dockerfile
-FROM python:3.11-slim
-
-RUN apt-get update && apt-get install -y git nodejs npm && rm -rf /var/lib/apt/lists/*
-# Only works if bobshell is publicly installable — replace with the real install command.
-RUN npm install -g bobshell || echo "bobshell not on npm; real Onboard will fail"
-
-WORKDIR /app
-COPY pyproject.toml README.md packages.txt ./
-COPY src ./src
-COPY streamlit_app.py .streamlit ./
-RUN pip install --no-cache-dir -e .[ui]
-
-EXPOSE 8501
-CMD ["streamlit", "run", "streamlit_app.py", "--server.port=8501", "--server.address=0.0.0.0"]
-```
-
-Push, set secrets in the Space's settings, done.
-
-## 4. The FastAPI HTTP surface (`compass serve`) for Orchestrate
-
-The Streamlit UI and the FastAPI service are independent. Watsonx Orchestrate calls the FastAPI service (`POST /onboard`, `POST /ask`) — deploy it wherever `bob` is reachable:
+Independent of the Streamlit UI. Deploy wherever Bob is actually installed:
 
 ```powershell
 compass serve --pack .\onboarding --host 0.0.0.0 --port 8080
 ```
 
-Then front it with a tunnel too, or run it on the same VM as Bob Shell.
+Same Bob-availability constraint applies — this is for the Orchestrate integration story, not for public traffic.
 
----
+## Submission checklist
 
-## What to actually submit to lablab
-
-1. **Live URL** — the `trycloudflare.com` link from `serve_public.ps1`, running on your machine during the judging window.
-2. **Backup UI-only URL** — the `streamlit.app` link from Streamlit Community Cloud, so judges after the window still see the artifact.
-3. **Loom / mp4 recording** — you running Compass locally against a real repo, showing the four subagents and the six MD files landing. Insurance if both links go down.
-4. **GitHub repo** — README, ARCHITECTURE, SPEC, MIT, and this DEPLOY.md.
-5. **Orchestrate note** — screenshots + the `orchestrate/*.yaml` files.
-
-The tunnel URL is the star of the submission. Everything else is scaffolding around it.
+1. ✅ **Streamlit Community Cloud URL** — the permanent link, accounts + Demo + History all working
+2. ✅ **GitHub repo** — README, ARCHITECTURE, SPEC, MIT license, this file
+3. ⬜ **Local recording** — a real onboarding run, proving the four Bob subagents work end-to-end
+4. ⬜ **Orchestrate note** — `orchestrate/*.yaml` + a screenshot, if you build that piece out

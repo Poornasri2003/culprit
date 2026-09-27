@@ -521,6 +521,19 @@ with tab_onboard:
     st.subheader("Onboard a repository")
     st.caption("Real runs need `BOB_API_KEY` in the sidebar and the `bob` CLI on the host.")
 
+    import shutil as _shutil2
+    from compass.infrastructure.bob_bootstrap import is_bootstrapped as _is_bootstrapped
+    if not (_shutil2.which("bob") or _is_bootstrapped()):
+        st.warning(
+            "**Bob CLI isn't available on this deployment**, so a real onboarding run "
+            "will fail here. This is expected on Streamlit Community Cloud — Bob ships "
+            "through IBM's official installer, not a package manager, so it can only "
+            "run on a host that has it installed (e.g., your own machine).\n\n"
+            "👉 Head to the **🎬 Demo (no key)** tab to see a full onboarding pack "
+            "without needing Bob at all, or run Compass locally for a real repo.",
+            icon="🧭",
+        )
+
     with st.container(border=True):
         st.markdown("**1. Source**")
         src_kind = st.radio(
