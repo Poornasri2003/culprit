@@ -2,6 +2,15 @@
 # than parsing pyproject.toml's optional-dependencies). Keep in sync with
 # the [project.dependencies] and [project.optional-dependencies.ui] lists
 # in pyproject.toml.
+#
+# CRITICAL: this line installs the `compass` package itself (src/ layout,
+# defined by pyproject.toml). Without it, streamlit_app.py's
+# `from compass.storage import ...` fails on Streamlit Cloud with a
+# ModuleNotFoundError, because `pip install -r requirements.txt` only
+# installs what's listed here -- it does not know to install the repo's
+# own package unless told to.
+-e .
+
 streamlit>=1.36
 click>=8.1
 pydantic>=2.6
